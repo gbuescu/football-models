@@ -17,12 +17,10 @@ layers, because the competitions behave differently.
 These are useful for research and for thinking about where a bookmaker's price
 looks wrong. They are not guarantees, and they are not a betting system.
 
-On the question of accuracy: I have tracked roughly a 70 to 80 percent
-per-match hit rate in my own use. That is my own informal record-keeping over
-matches I happened to bet or follow, not a formal backtest, and it is not a
-promise about future results. It is not corrected for which markets I picked or
-which matches I skipped. Take it as a rough personal figure rather than a
-measured one.
+On accuracy: I have tracked roughly a 70 to 80 percent per-match hit rate in my
+own use. That is informal record-keeping on matches I followed or bet, not a
+formal backtest, and it is not corrected for the markets I picked or the games
+I skipped. Treat it as a rough personal figure rather than a measured one.
 
 ## What is in the repo
 
