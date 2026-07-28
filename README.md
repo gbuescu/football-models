@@ -26,27 +26,31 @@ measured one.
 
 ## What is in the repo
 
-`regular_prediction_model.py`
+### `regular_prediction_model.py`
+
 The standard general model. Dixon-Coles goals model with a corners predictor on
 top. Outputs 1X2, over/under 1.5, 2.5 and 3.5, both teams to score, the most
 likely scoreline, double chance, and corner markets. It is the only script that
 can read real corner counts from a second API if you have a key for one. Set
 the competition code and fixture list in `main()`.
 
-`pl_model.py`
+### `pl_model.py`
+
 A refined Premier League version. Adds a full analysis of a completed season,
 time-decay weighting so late-season form counts for more, sample-size
 shrinkage, a half-time model, a negative binomial on corner totals, priors for
 promoted clubs, and careful handling of club names. Home advantage is tuned for
 the league.
 
-`liga_portugal_model.py`
+### `liga_portugal_model.py`
+
 A refined Liga Portugal version, built on the same two-stage shape as the
 Premier League script. Tuned separately: home advantage is noticeably stronger,
 the low-score correction fitted differently on real data, and name matching has
 to cope with accented spellings rather than clubs sharing common words.
 
-`cl_corners_model.py`
+### `cl_corners_model.py`
+
 A refined variant for the Champions League and the Championship, aimed at goals
 and corners in a simpler output format. Cut down on purpose, since knockout and
 cup competitions do not give you a full league season to fit against. It drops
