@@ -1,0 +1,361 @@
+"""Standard club prediction model.
+
+A Dixon-Coles goals model with a corners predictor on top. This is the base
+version the league-specific scripts are refined from, and the one to start
+with for a competition that has no script of its own.
+
+Set the competition code and the fixture list in main(). Standard library only.
+"""
+
+import math
+import os
+import urllib.request
+import json
+from collections import defaultdict
+
+
+def _load_api_key(var="FOOTBALL_DATA_KEY", required=True):
+    """Read a key from the environment, falling back to a local .env file.
+    Parsed by hand rather than with python-dotenv to keep the script
+    dependency-free. Never hardcode a key here: see .env.example."""
+    val = os.environ.get(var)
+    if val:
+        return val
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, ".env"), os.path.join(here, os.pardir, ".env")):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith(var + "="):
+                        return line.split("=", 1)[1].strip().strip("\"'")
+        except OSError:
+            continue
+    if not required:
+        return ""
+    raise SystemExit(
+        var + " is not set.\n"
+        "  export " + var + "=your_key   (or: cp .env.example .env and edit it)\n"
+        "  Free key: https://www.football-data.org/client/register"
+    )
+
+
+API_KEY  = _load_api_key()
+BASE_URL = "https://api.football-data.org/v4"
+
+def api_get(endpoint, params=None):
+    url = f"{BASE_URL}{endpoint}"
+    if params:
+        url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
+    req = urllib.request.Request(url, headers={"X-Auth-Token": API_KEY})
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read())
+
+def fetch_finished_matches(competition, limit=380):
+    try:
+        data = api_get(f"/competitions/{competition}/matches",
+                       {"status": "FINISHED", "limit": limit})
+        matches = []
+        for m in data.get("matches", []):
+            home = m["homeTeam"]["shortName"]
+            away = m["awayTeam"]["shortName"]
+            hg   = m["score"]["fullTime"]["home"]
+            ag   = m["score"]["fullTime"]["away"]
+            date = m.get("utcDate", "")
+            if hg is None or ag is None:
+                continue
+            matches.append((home, away, int(hg), int(ag), date))
+        print(f"  [{competition}] Fetched {len(matches)} finished matches.")
+        return matches
+    except Exception as e:
+        print(f"  [{competition}] API error: {e}. Using neutral ratings.")
+        return []
+
+def auto_shrinkage(n_matches):
+    if   n_matches < 100:  return 0.12
+    elif n_matches < 200:  return 0.08
+    elif n_matches < 300:  return 0.05
+    else:                  return 0.03
+
+def fit_team_ratings(matches, home_advantage=1.35, n_iter=300, lr=0.01,
+                     decay=0.0035, shrinkage=None):
+    if shrinkage is None:
+        shrinkage = auto_shrinkage(len(matches))
+        print(f"  Auto-selected shrinkage: {shrinkage} for {len(matches)} matches")
+    teams = set()
+    for h, a, _, _, _ in matches:
+        teams.add(h); teams.add(a)
+    attack  = {t: 1.0 for t in teams}
+    defence = {t: 1.0 for t in teams}
+    matches_sorted = sorted(matches, key=lambda x: x[4])
+    n = len(matches_sorted)
+    weights = [math.exp(-decay * (n - 1 - i)) for i in range(n)]
+    avg_home = sum(w * hg for (_, _, hg, _, _), w in zip(matches_sorted, weights)) / sum(weights)
+    avg_away = sum(w * ag for (_, _, _, ag, _), w in zip(matches_sorted, weights)) / sum(weights)
+    team_matches = defaultdict(float)
+    for (h, a, _, _, _), w in zip(matches_sorted, weights):
+        team_matches[h] += w; team_matches[a] += w
+    for _ in range(n_iter):
+        att_num = defaultdict(float); att_den = defaultdict(float)
+        def_num = defaultdict(float); def_den = defaultdict(float)
+        for (h, a, hg, ag, _), w in zip(matches_sorted, weights):
+            lam_h = avg_home * attack[h] * defence[a] * home_advantage
+            lam_a = avg_away * attack[a] * defence[h]
+            att_num[h] += w * hg;  att_den[h] += w * lam_h / attack[h]
+            att_num[a] += w * ag;  att_den[a] += w * lam_a / attack[a]
+            def_num[a] += w * hg;  def_den[a] += w * lam_h / defence[a]
+            def_num[h] += w * ag;  def_den[h] += w * lam_a / defence[h]
+        for t in teams:
+            shrink_t = shrinkage * (20 / (team_matches[t] + 20))
+            if att_den[t] > 0:
+                attack[t]  = attack[t] * ((att_num[t] / att_den[t]) ** lr)
+                attack[t]  = attack[t] * (1 - shrink_t) + shrink_t
+            if def_den[t] > 0:
+                defence[t] = defence[t] * ((def_num[t] / def_den[t]) ** lr)
+                defence[t] = defence[t] * (1 - shrink_t) + shrink_t
+        att_mean = math.exp(sum(math.log(v) for v in attack.values())  / len(teams))
+        def_mean = math.exp(sum(math.log(v) for v in defence.values()) / len(teams))
+        attack  = {t: v / att_mean for t, v in attack.items()}
+        defence = {t: v / def_mean for t, v in defence.items()}
+    return attack, defence, avg_home, avg_away
+
+def fit_rho(matches, attack, defence, avg_home, avg_away, home_advantage):
+    best_rho, best_ll = -0.13, float("-inf")
+    for rho_test in [-0.25, -0.20, -0.18, -0.15, -0.13, -0.10, -0.08, -0.05, 0.0, 0.05]:
+        ll = 0.0
+        for h, a, hg, ag, _ in matches:
+            h_att = attack.get(h, 1.0); h_def = defence.get(h, 1.0)
+            a_att = attack.get(a, 1.0); a_def = defence.get(a, 1.0)
+            lh = avg_home * h_att * a_def * home_advantage
+            la = avg_away * a_att * h_def
+            ph = poisson_pmf(hg, lh); pa = poisson_pmf(ag, la)
+            tau = dixon_coles_tau(hg, ag, lh, la, rho_test)
+            p = ph * pa * tau
+            if p > 0: ll += math.log(p)
+        if ll > best_ll: best_ll, best_rho = ll, rho_test
+    return best_rho
+
+def calibrate_probability(p, strength=0.08):
+    return p * (1 - strength) + 0.5 * strength
+
+def poisson_pmf(k, lam):
+    if lam <= 0: return 1.0 if k == 0 else 0.0
+    return math.exp(-lam) * (lam ** k) / math.factorial(k)
+
+def dixon_coles_tau(i, j, lh, la, rho=-0.13):
+    if   i == 0 and j == 0: return 1 - lh * la * rho
+    elif i == 1 and j == 0: return 1 + la * rho
+    elif i == 0 and j == 1: return 1 + lh * rho
+    elif i == 1 and j == 1: return 1 - rho
+    else:                   return 1.0
+
+def build_score_matrix(lh, la, rho=-0.13, max_goals=7):
+    ph = [poisson_pmf(i, lh) for i in range(max_goals + 1)]
+    pa = [poisson_pmf(j, la) for j in range(max_goals + 1)]
+    matrix = [[ph[i] * pa[j] * dixon_coles_tau(i, j, lh, la, rho)
+               for j in range(max_goals + 1)]
+              for i in range(max_goals + 1)]
+    total = sum(matrix[i][j] for i in range(max_goals+1) for j in range(max_goals+1))
+    return [[v / total for v in row] for row in matrix]
+
+def summarize_matrix(matrix, max_goals=7, calibrate=True):
+    s = dict.fromkeys(["home","draw","away","over_1_5","under_1_5","over_2_5",
+                       "under_2_5","over_3_5","under_3_5","btts_yes","btts_no"], 0.0)
+    for i in range(max_goals + 1):
+        for j in range(max_goals + 1):
+            p = matrix[i][j]; g = i + j
+            if   i > j:  s["home"] += p
+            elif i == j: s["draw"] += p
+            else:        s["away"] += p
+            if g >= 2: s["over_1_5"] += p
+            else:      s["under_1_5"] += p
+            if g >= 3: s["over_2_5"] += p
+            else:      s["under_2_5"] += p
+            if g >= 4: s["over_3_5"] += p
+            else:      s["under_3_5"] += p
+            if i >= 1 and j >= 1: s["btts_yes"] += p
+            else:                 s["btts_no"]  += p
+    if calibrate:
+        for k in ["home", "draw", "away"]:
+            s[k] = calibrate_probability(s[k])
+        tot = s["home"] + s["draw"] + s["away"]
+        if tot > 0:
+            s["home"] /= tot; s["draw"] /= tot; s["away"] /= tot
+    return s
+
+def prob_to_odds(p):
+    return f"{1/p:.2f}" if p > 0.0001 else "inf"
+
+def most_likely_score(matrix, max_goals=7):
+    best_p, best = 0.0, (0, 0)
+    for i in range(max_goals + 1):
+        for j in range(max_goals + 1):
+            if matrix[i][j] > best_p:
+                best_p = matrix[i][j]; best = (i, j)
+    return best, best_p
+
+def confidence_flag(lh, la):
+    if lh > 3.5 or la > 3.5: return "OVERFITTED -- goals markets only"
+    if lh / max(la, 0.01) > 4 or la / max(lh, 0.01) > 4: return "EXTREME RATIO -- result markets unreliable"
+    if lh + la > 4.5: return "HIGH-VARIANCE -- goals likely but result uncertain"
+    return "RELIABLE"
+
+def print_prediction(home, away, lh, la, league=None, kickoff=None, rho=-0.13):
+    matrix  = build_score_matrix(lh, la, rho)
+    summary = summarize_matrix(matrix, calibrate=True)
+    ml, mlp = most_likely_score(matrix)
+    flag    = confidence_flag(lh, la)
+    print("=" * 72)
+    print(f"  [{league}] [{kickoff}]" if league else "")
+    print(f"  {home}  vs  {away}")
+    print(f"  Confidence: {flag}")
+    print(f"  xG  {home}: {lh:.2f}   {away}: {la:.2f}   (rho={rho})")
+    print("-" * 72)
+    print(f"  1X2 :  Home {summary['home']*100:5.1f}% ({prob_to_odds(summary['home'])})  "
+          f"Draw {summary['draw']*100:5.1f}% ({prob_to_odds(summary['draw'])})  "
+          f"Away {summary['away']*100:5.1f}% ({prob_to_odds(summary['away'])})")
+    print(f"  O/U :  O1.5 {summary['over_1_5']*100:5.1f}%  "
+          f"O2.5 {summary['over_2_5']*100:5.1f}%  O3.5 {summary['over_3_5']*100:5.1f}%")
+    print(f"  BTTS:  Yes {summary['btts_yes']*100:5.1f}%   No {summary['btts_no']*100:5.1f}%")
+    print(f"  Best score: {ml[0]}-{ml[1]}  ({mlp*100:.1f}%)")
+    print(f"  WDW home: {(summary['home']+summary['draw'])*100:.1f}%  "
+          f"WDW away: {(summary['away']+summary['draw'])*100:.1f}%")
+    print()
+
+# Corners. The same machinery as goals, but it only means anything if it is
+# fit on actual corner counts. football-data.org returns scores only, so either
+# paste counts into CORNER_DATA or set APISPORTS_KEY for the API-Football feed.
+# With neither, the model falls back to a goal-rating proxy: sides that
+# out-score and out-concede tend to out-corner as well, damped. That is
+# directionally useful, not a replacement for real corner data.
+CORNER_BASE       = 5.0   # corners per team, so roughly 10 in an even game
+CORNER_PROXY_BETA = 0.6   # damping when deriving corner ratings from goal ratings
+CORNER_DATA = [
+    # ("Arsenal", "Chelsea", 8, 4, "2026-03-01"),   # (home, away, hc, ac, date)
+]
+CORNER_API_KEY = _load_api_key("APISPORTS_KEY", required=False)
+
+def fetch_corner_matches(league_id=None, season=None, limit=380):
+    """API-Football adapter -> [(home, away, hc, ac, date), ...].
+    Pulls finished fixtures, then each fixture's statistics, and reads the
+    'Corner Kicks' stat. One stats call per fixture, so it burns request quota
+    quickly. Cache the results. Field names vary by plan, so check yours."""
+    if not CORNER_API_KEY or league_id is None or season is None:
+        return []
+    base = "https://v3.football.api-sports.io"
+    hdr  = {"x-apisports-key": CORNER_API_KEY}
+    def _get(path):
+        req = urllib.request.Request(base + path, headers=hdr)
+        with urllib.request.urlopen(req) as r:
+            return json.loads(r.read())
+    out = []
+    fx = _get(f"/fixtures?league={league_id}&season={season}&status=FT")
+    for f in fx.get("response", [])[:limit]:
+        fid = f["fixture"]["id"]
+        hn, an = f["teams"]["home"]["name"], f["teams"]["away"]["name"]
+        dt = f["fixture"]["date"]
+        hc = ac = None
+        for side in _get(f"/fixtures/statistics?fixture={fid}").get("response", []):
+            nm = side["team"]["name"]
+            for s in side.get("statistics", []):
+                if s.get("type") == "Corner Kicks":
+                    v = s.get("value") or 0
+                    if   nm == hn: hc = int(v)
+                    elif nm == an: ac = int(v)
+        if hc is not None and ac is not None:
+            out.append((hn, an, hc, ac, dt))
+    return out
+
+def summarize_corners(matrix):
+    n = len(matrix)
+    exp_h = exp_a = hm = tie = am = 0.0
+    home_marg = [0.0]*n; away_marg = [0.0]*n; totals = {}
+    for i in range(n):
+        for j in range(n):
+            p = matrix[i][j]
+            exp_h += i*p; exp_a += j*p
+            home_marg[i] += p; away_marg[j] += p
+            if   i > j:  hm  += p
+            elif i == j: tie += p
+            else:        am  += p
+            totals[i+j] = totals.get(i+j, 0.0) + p
+    ou = {L: sum(p for t, p in totals.items() if t > L)
+          for L in [7.5, 8.5, 9.5, 10.5, 11.5, 12.5]}
+    return {"exp_h": exp_h, "exp_a": exp_a, "exp_tot": exp_h+exp_a,
+            "home_more": hm, "tie": tie, "away_more": am, "ou": ou,
+            "totals": totals, "home_marg": home_marg, "away_marg": away_marg}
+
+def print_corner_prediction(home, away, lh, la, league=None, kickoff=None):
+    matrix = build_score_matrix(lh, la, 0.0, max_goals=16)  # rho=0 -> indep Poisson
+    s = summarize_corners(matrix)
+    od = lambda p: f"{1/p:.2f}" if p > 0.0001 else "inf"
+    hk = max(1, int(lh)); ak = max(1, int(la))
+    p_h = sum(s["home_marg"][x] for x in range(hk, len(s["home_marg"])))
+    p_a = sum(s["away_marg"][x] for x in range(ak, len(s["away_marg"])))
+    top = sorted(s["totals"].items(), key=lambda x: -x[1])[:3]
+    ou = s["ou"]
+    print("=" * 72)
+    print(f"  [{league}] [{kickoff}]" if league else "")
+    print(f"  {home}  vs  {away}   (CORNERS)")
+    print(f"  xCorners  {home}: {lh:.1f}   {away}: {la:.1f}   total: {s['exp_tot']:.1f}")
+    print("-" * 72)
+    print(f"  Totals:  O8.5 {ou[8.5]*100:4.1f}% ({od(ou[8.5])})   "
+          f"O9.5 {ou[9.5]*100:4.1f}% ({od(ou[9.5])})   "
+          f"O10.5 {ou[10.5]*100:4.1f}% ({od(ou[10.5])})   "
+          f"O11.5 {ou[11.5]*100:4.1f}% ({od(ou[11.5])})")
+    print(f"  Most corners:  {home} {s['home_more']*100:4.1f}%   "
+          f"Tie {s['tie']*100:4.1f}%   {away} {s['away_more']*100:4.1f}%")
+    print(f"  Team totals:  {home} over {hk-0.5:.1f}: {p_h*100:4.1f}% ({od(p_h)})   "
+          f"{away} over {ak-0.5:.1f}: {p_a*100:4.1f}% ({od(p_a)})")
+    print(f"  Most likely total: " + ", ".join(f"{t} ({p*100:.0f}%)" for t, p in top))
+    print()
+
+def main():
+    # Competition codes: PL, ELC, PD, BL1, SA, FL1, CL, EL, EC, PPL
+    matches = fetch_finished_matches("PL")
+    if len(matches) >= 10:
+        att, dff, avg_h, avg_a = fit_team_ratings(matches, home_advantage=1.20)
+        rho = fit_rho(matches, att, dff, avg_h, avg_a, 1.20)
+        print(f"  Best rho: {rho}")
+    else:
+        att, dff, avg_h, avg_a, rho = {}, {}, 1.50, 1.15, -0.13
+
+    def lam(home, away, ha=1.20):
+        h_att = att.get(home, 1.0); h_def = dff.get(home, 1.0)
+        a_att = att.get(away, 1.0); a_def = dff.get(away, 1.0)
+        return round(avg_h * h_att * a_def * ha, 3), round(avg_a * a_att * h_def, 3)
+
+    fixtures = [
+        # ("Home Team", "Away Team", "Kickoff"),
+    ]
+    for home, away, ko in fixtures:
+        lh, la = lam(home, away)
+        print_prediction(home, away, lh, la, league="Premier League", kickoff=ko, rho=rho)
+
+    print("#" * 72)
+    print("#  CORNERS")
+    print("#" * 72)
+    HOME_CORNER_ADV = 1.10   # home sides win slightly more corners
+    cmatches = CORNER_DATA or fetch_corner_matches()
+    if cmatches and len(cmatches) >= 10:
+        catt, cconc, avg_hc, avg_ac = fit_team_ratings(
+            cmatches, home_advantage=HOME_CORNER_ADV)
+        print(f"  Corner model: fitted on {len(cmatches)} corner records\n")
+    else:
+        catt  = {t: att.get(t, 1.0) ** CORNER_PROXY_BETA for t in att}
+        cconc = {t: dff.get(t, 1.0) ** CORNER_PROXY_BETA for t in dff}
+        avg_hc = avg_ac = CORNER_BASE
+        print("  Corner model: GOAL-RATING PROXY (no corner data supplied)\n")
+
+    def clam(home, away):
+        h_catt = catt.get(home, 1.0); h_ccon = cconc.get(home, 1.0)
+        a_catt = catt.get(away, 1.0); a_ccon = cconc.get(away, 1.0)
+        return (round(avg_hc * h_catt * a_ccon * HOME_CORNER_ADV, 3),
+                round(avg_ac * a_catt * h_ccon, 3))
+
+    for home, away, ko in fixtures:
+        lhc, lac = clam(home, away)
+        print_corner_prediction(home, away, lhc, lac, league="Premier League", kickoff=ko)
+
+if __name__ == "__main__":
+    main()

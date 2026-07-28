@@ -1,0 +1,709 @@
+# -*- coding: utf-8 -*-
+"""Premier League model, refined from regular_prediction_model.py.
+
+Runs in two stages. Stage one pulls every finished match of the completed
+season and reports the league-wide splits, the final table rebuilt from the
+match record, per-team home and away breakdowns, and the common scorelines,
+then writes the lot to CSV. Stage two fits Dixon-Coles ratings on those same
+matches and applies them to the opening fixtures.
+
+What this adds over the standard model: time-decay weighting so late-season
+form counts for more, sample-size shrinkage, a half-time model built from the
+free tier's half-time scores, a negative binomial on corner totals, promoted
+side priors, and the guarded name resolution described below. Home advantage
+is 1.20 here, tuned for this league.
+
+The rebuilt table is the fetch sanity check. Arsenal should come out champions
+for 2025-26, with West Ham, Burnley and Wolves in the bottom three. If the
+champions are wrong, the pull is broken and nothing below it is worth reading.
+
+Two things that look like fussiness but are not:
+
+Season keys. football-data.org keys a season by its starting year, so 2025 is
+2025-26. Requesting without the season parameter returns the current season,
+which in August has no finished matches and quietly leaves every team on a
+neutral 1.0 rating. Hence SEASON is always explicit.
+
+Name resolution. Token matching is genuinely dangerous in this league.
+"Manchester United" shares 'united' with Leeds United, and both Coventry City
+and Hull City share 'city' with Manchester City. Matched naively, Coventry
+City resolved to Man City, which would have rated a promoted club as the best
+side in the division and still printed RELIABLE. Three guards prevent that:
+promoted clubs short-circuit to the prior before any matching runs, an explicit
+ALIASES table does the real work, and a match on a weak token alone is
+rejected rather than guessed. All three are load-bearing.
+"""
+
+import csv
+import json
+import math
+import os
+import unicodedata
+import urllib.request
+from collections import defaultdict, Counter
+
+
+def _load_api_key(var="FOOTBALL_DATA_KEY", required=True):
+    """Read a key from the environment, falling back to a local .env file.
+    Parsed by hand rather than with python-dotenv to keep the script
+    dependency-free. Never hardcode a key here: see .env.example."""
+    val = os.environ.get(var)
+    if val:
+        return val
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, ".env"), os.path.join(here, os.pardir, ".env")):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith(var + "="):
+                        return line.split("=", 1)[1].strip().strip("\"'")
+        except OSError:
+            continue
+    if not required:
+        return ""
+    raise SystemExit(
+        var + " is not set.\n"
+        "  export " + var + "=your_key   (or: cp .env.example .env and edit it)\n"
+        "  Free key: https://www.football-data.org/client/register"
+    )
+
+
+API_KEY  = _load_api_key()
+BASE_URL    = "https://api.football-data.org/v4"
+COMPETITION = "PL"           # Premier League (free tier)
+
+SEASON      = 2025           # starting year, so 2025 means the 2025-26 season
+FETCH_LIMIT = 400            # a 20-team season is exactly 380, with margin added
+MIN_MATCHES = 40             # below this the ratings are meaningless
+
+HOME_ADV    = 1.20           # Premier League home advantage
+DECAY       = 0.0035         # time-decay, so late-season form outweighs August
+RHO_DEFAULT = -0.13          # Dixon-Coles low-score correction
+
+# Promoted sides have no top-flight record to fit against. Attack below 1 means
+# scores less than league average, defence above 1 means concedes more. These
+# are a judgment call rather than a fitted value, so tune them if you disagree,
+# but do not leave them at 1.0: that rates a promoted side as mid-table.
+PROMOTED_ATT = 0.80
+PROMOTED_DEF = 1.20
+PROMOTED     = {"Coventry City", "Ipswich Town", "Hull City"}   # up for 2026-27
+
+EXPORT_CSV   = "premier_league_2025_26_matches.csv"
+
+CORNER_BASE       = 5.1    # about 10.2 in total, the league's rough long-run average
+CORNER_PROXY_BETA = 0.6    # damping when deriving corner form from goal form
+HOME_CORNER_ADV   = 1.10   # home sides win slightly more corners
+CORNER_DISPERSION = 1.25   # variance/mean for corner totals, re-estimated
+                           # from data when real corner counts are available
+CORNER_DATA       = []     # optional override: ("Arsenal","Chelsea",7,4,"2026-05-01")
+
+# Matchday 1, 2026-27. A full round is 10 games; Chelsea and Fulham are the two
+# clubs unaccounted for here. Uncomment and set the home side once known.
+FIXTURES = [
+    ("Arsenal",                "Coventry City",      "Fri 21 Aug 20:00"),
+    ("Hull City",              "Manchester United",  "Sat 22 Aug 12:30"),
+    ("Everton",                "Crystal Palace",     "Sat 22 Aug 15:00"),
+    ("Ipswich Town",           "Sunderland",         "Sat 22 Aug 15:00"),
+    ("Nottingham Forest",      "Leeds United",       "Sat 22 Aug 15:00"),
+    ("Brentford",              "Tottenham Hotspur",  "Sat 22 Aug 17:30"),
+    ("Brighton & Hove Albion", "Aston Villa",        "Sun 23 Aug 14:00"),
+    ("Manchester City",        "AFC Bournemouth",    "Sun 23 Aug 14:00"),
+    ("Newcastle United",       "Liverpool",          "Sun 23 Aug 16:30"),
+    # ("Chelsea",              "Fulham",             "TBC"),
+]
+
+# Display name -> the spellings football-data.org might use, best guess first.
+ALIASES = {
+    "Manchester United":      ["Man United", "Man Utd", "Manchester United"],
+    "Manchester City":        ["Man City", "Manchester City"],
+    "Tottenham Hotspur":      ["Tottenham", "Spurs", "Tottenham Hotspur"],
+    "Newcastle United":       ["Newcastle", "Newcastle United"],
+    "Nottingham Forest":      ["Nottingham", "Nott'm Forest", "Nottingham Forest"],
+    "Brighton & Hove Albion": ["Brighton Hove", "Brighton", "Brighton & Hove Albion"],
+    "AFC Bournemouth":        ["Bournemouth", "AFC Bournemouth"],
+    "Leeds United":           ["Leeds United", "Leeds"],
+    "Crystal Palace":         ["Crystal Palace"],
+    "Aston Villa":            ["Aston Villa"],
+    "West Ham United":        ["West Ham", "West Ham United"],
+    "Wolverhampton Wanderers":["Wolverhampton", "Wolves"],
+    "Coventry City":          ["Coventry City", "Coventry"],
+    "Hull City":              ["Hull City", "Hull"],
+    "Ipswich Town":           ["Ipswich Town", "Ipswich"],
+}
+
+
+def api_get(endpoint, params=None):
+    url = f"{BASE_URL}{endpoint}"
+    if params:
+        url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
+    req = urllib.request.Request(url, headers={"X-Auth-Token": API_KEY})
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
+def fetch_season(competition, season, limit=FETCH_LIMIT):
+    """Every finished match of one season, with every field the feed exposes.
+    -> [{home, away, hg, ag, hth, hta, date, matchday}, ...]"""
+    try:
+        data = api_get(f"/competitions/{competition}/matches",
+                       {"status": "FINISHED", "season": season, "limit": limit})
+    except Exception as e:
+        print(f"  [{competition} {season}] API error: {e}")
+        return []
+    raw = data.get("matches", [])
+    if len(raw) >= limit:
+        print(f"  [warn] hit the {limit}-match limit -- results may be truncated.")
+    out = []
+    for m in raw:
+        ft = m.get("score", {}).get("fullTime", {}) or {}
+        ht = m.get("score", {}).get("halfTime", {}) or {}
+        hg, ag = ft.get("home"), ft.get("away")
+        if hg is None or ag is None:
+            continue
+        out.append({
+            "home":     m["homeTeam"].get("shortName") or m["homeTeam"].get("name"),
+            "away":     m["awayTeam"].get("shortName") or m["awayTeam"].get("name"),
+            "hg":       int(hg),
+            "ag":       int(ag),
+            "hth":      ht.get("home"),
+            "hta":      ht.get("away"),
+            "date":     m.get("utcDate", ""),
+            "matchday": m.get("matchday"),
+        })
+    out.sort(key=lambda x: x["date"])
+    print(f"  [{competition} {season}-{season+1}] {len(out)} finished matches fetched.")
+    return out
+
+
+def export_csv(recs, path):
+    if not recs:
+        return
+    cols = ["matchday", "date", "home", "away", "hg", "ag", "hth", "hta"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(recs)
+    print(f"  Exported {len(recs)} match records -> {path}")
+
+
+def goals_view(recs):
+    return [(r["home"], r["away"], r["hg"], r["ag"], r["date"]) for r in recs]
+
+
+def halftime_view(recs):
+    return [(r["home"], r["away"], int(r["hth"]), int(r["hta"]), r["date"])
+            for r in recs if r["hth"] is not None and r["hta"] is not None]
+
+
+def _blank():
+    return {"pld": 0, "w": 0, "d": 0, "l": 0, "gf": 0, "ga": 0,
+            "hw": 0, "hd": 0, "hl": 0, "hgf": 0, "hga": 0,
+            "aw": 0, "ad": 0, "al": 0, "agf": 0, "aga": 0,
+            "cs": 0, "fts": 0, "btts": 0, "o25": 0}
+
+
+def analyse_season(recs):
+    """Per-team breakdown of every match played."""
+    T = defaultdict(_blank)
+    for r in recs:
+        h, a, hg, ag = r["home"], r["away"], r["hg"], r["ag"]
+        H, A = T[h], T[a]
+        H["pld"] += 1; A["pld"] += 1
+        H["gf"] += hg; H["ga"] += ag; H["hgf"] += hg; H["hga"] += ag
+        A["gf"] += ag; A["ga"] += hg; A["agf"] += ag; A["aga"] += hg
+        if hg > ag:
+            H["w"] += 1; H["hw"] += 1; A["l"] += 1; A["al"] += 1
+        elif ag > hg:
+            A["w"] += 1; A["aw"] += 1; H["l"] += 1; H["hl"] += 1
+        else:
+            H["d"] += 1; H["hd"] += 1; A["d"] += 1; A["ad"] += 1
+        if ag == 0: H["cs"]  += 1
+        if hg == 0: A["cs"]  += 1
+        if hg == 0: H["fts"] += 1
+        if ag == 0: A["fts"] += 1
+        if hg >= 1 and ag >= 1:
+            H["btts"] += 1; A["btts"] += 1
+        if hg + ag >= 3:
+            H["o25"] += 1; A["o25"] += 1
+    for t in T:
+        T[t]["pts"] = T[t]["w"] * 3 + T[t]["d"]
+        T[t]["gd"]  = T[t]["gf"] - T[t]["ga"]
+    return dict(T)
+
+
+def print_season_report(recs, T):
+    n   = len(recs)
+    hw  = sum(1 for r in recs if r["hg"] > r["ag"])
+    dr  = sum(1 for r in recs if r["hg"] == r["ag"])
+    aw  = n - hw - dr
+    gh  = sum(r["hg"] for r in recs)
+    ga  = sum(r["ag"] for r in recs)
+    o15 = sum(1 for r in recs if r["hg"] + r["ag"] >= 2)
+    o25 = sum(1 for r in recs if r["hg"] + r["ag"] >= 3)
+    o35 = sum(1 for r in recs if r["hg"] + r["ag"] >= 4)
+    bt  = sum(1 for r in recs if r["hg"] >= 1 and r["ag"] >= 1)
+    hv  = [r for r in recs if r["hth"] is not None and r["hta"] is not None]
+    pc  = lambda x: f"{x/n*100:5.1f}%"
+
+    print("=" * 78)
+    print(f"  STAGE 1 -- ANALYSIS OF ALL {n} MATCHES, {SEASON}-{SEASON+1}")
+    print("=" * 78)
+    print(f"  Result split : Home {pc(hw)}   Draw {pc(dr)}   Away {pc(aw)}")
+    print(f"  Goals        : {(gh+ga)/n:.2f}/game   home {gh/n:.2f}  away {ga/n:.2f}"
+          f"   (raw home/away ratio {gh/max(ga,1):.2f}, model HA={HOME_ADV})")
+    print(f"  Over/Under   : O1.5 {pc(o15)}   O2.5 {pc(o25)}   O3.5 {pc(o35)}")
+    print(f"  BTTS         : Yes {pc(bt)}   No {pc(n-bt)}")
+    if hv:
+        hg1 = sum(r["hth"] + r["hta"] for r in hv)
+        nil = sum(1 for r in hv if r["hth"] == 0 and r["hta"] == 0)
+        print(f"  Half-time    : {hg1/len(hv):.2f} goals/game "
+              f"({hg1/max(gh+ga,1)*100:.0f}% of all goals before the break)   "
+              f"HT 0-0 {nil/len(hv)*100:.1f}%   [{len(hv)} matches with HT data]")
+    sc = Counter((r["hg"], r["ag"]) for r in recs).most_common(6)
+    print("  Top scorelines: " + ", ".join(f"{i}-{j} ({c/n*100:.1f}%)" for (i, j), c in sc))
+    print()
+
+    order = sorted(T, key=lambda t: (-T[t]["pts"], -T[t]["gd"], -T[t]["gf"]))
+    print("-" * 78)
+    print(f"  FINAL TABLE {SEASON}-{SEASON+1}  (reconstructed from the match record)")
+    print("-" * 78)
+    print(f"  {'#':>2}  {'TEAM':<22}{'P':>3}{'W':>4}{'D':>3}{'L':>4}"
+          f"{'GF':>5}{'GA':>4}{'GD':>5}{'PTS':>5}")
+    for i, t in enumerate(order, 1):
+        s = T[t]
+        print(f"  {i:>2}  {t:<22}{s['pld']:>3}{s['w']:>4}{s['d']:>3}{s['l']:>4}"
+              f"{s['gf']:>5}{s['ga']:>4}{s['gd']:>+5}{s['pts']:>5}")
+    print()
+
+    print("-" * 78)
+    print("  HOME / AWAY SPLITS AND PER-TEAM RATES")
+    print("-" * 78)
+    print(f"  {'TEAM':<22}{'HOME WDL':>10}{'AWAY WDL':>10}{'GF/g':>7}{'GA/g':>7}"
+          f"{'CS':>4}{'FTS':>5}{'BTTS':>7}{'O2.5':>7}")
+    for t in order:
+        s = T[t]
+        home_rec = f"{s['hw']}-{s['hd']}-{s['hl']}"
+        away_rec = f"{s['aw']}-{s['ad']}-{s['al']}"
+        print(f"  {t:<22}{home_rec:>10}{away_rec:>10}"
+              f"{s['gf']/s['pld']:>7.2f}{s['ga']/s['pld']:>7.2f}"
+              f"{s['cs']:>4}{s['fts']:>5}"
+              f"{s['btts']/s['pld']*100:>6.0f}%{s['o25']/s['pld']*100:>6.0f}%")
+    print()
+
+
+# Tokens that identify a club type rather than a club. A match on these alone
+# means nothing: 'city' does not make Coventry into Manchester City.
+WEAK      = {"city", "united", "town", "albion", "wanderers", "hotspur",
+             "rovers", "county", "athletic", "afc", "fc"}
+STOPWORDS = {"fc", "afc", "and", "the"}
+
+
+def _flat(s):
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii").lower()
+    return "".join(ch for ch in s if ch.isalnum())
+
+
+def _tokens(name):
+    s = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii").lower()
+    s = "".join(ch if ch.isalnum() else " " for ch in s)
+    return [t for t in s.split() if t and t not in STOPWORDS]
+
+
+def resolve(name, data_teams):
+    """-> (api_name | None, how). Promoted clubs short-circuit; aliases do the
+    real work; weak-token-only matches are rejected, never guessed."""
+    if name in PROMOTED:
+        return None, "promoted"
+    flat = {}
+    for t in data_teams:
+        flat.setdefault(_flat(t), t)
+    for cand in ALIASES.get(name, []) + [name]:
+        hit = flat.get(_flat(cand))
+        if hit:
+            return hit, "alias"
+    qt = _tokens(name)
+    scored = []
+    for t in data_teams:
+        ct = set(_tokens(t))
+        s = sum(1.0 if tok not in WEAK else 0.15 for tok in qt if tok in ct)
+        if s > 0:
+            scored.append((s, t))
+    if not scored:
+        return None, "no match"
+    scored.sort(key=lambda x: -x[0])
+    if scored[0][0] < 1.0:
+        return None, f"weak-token-only ({scored[0][1]}) -- REJECTED"
+    if len(scored) > 1 and abs(scored[0][0] - scored[1][0]) < 1e-9:
+        return None, f"AMBIGUOUS ({scored[0][1]} / {scored[1][1]})"
+    return scored[0][1], "token"
+
+
+def auto_shrinkage(n_matches):
+    if   n_matches < 100:  return 0.12
+    elif n_matches < 200:  return 0.08
+    elif n_matches < 300:  return 0.05
+    else:                  return 0.03
+
+
+def fit_team_ratings(matches, home_advantage=HOME_ADV, n_iter=300, lr=0.01,
+                     decay=DECAY, shrinkage=None, label=""):
+    """matches: [(home, away, home_count, away_count, date), ...]
+    Counts are goals, half-time goals or corners -- same machinery either way."""
+    if shrinkage is None:
+        shrinkage = auto_shrinkage(len(matches))
+        print(f"  {label}shrinkage {shrinkage} on {len(matches)} matches")
+    teams = set()
+    for h, a, _, _, _ in matches:
+        teams.add(h); teams.add(a)
+    attack  = {t: 1.0 for t in teams}
+    defence = {t: 1.0 for t in teams}
+    ms = sorted(matches, key=lambda x: x[4])
+    n = len(ms)
+    weights = [math.exp(-decay * (n - 1 - i)) for i in range(n)]
+    avg_home = sum(w * hg for (_, _, hg, _, _), w in zip(ms, weights)) / sum(weights)
+    avg_away = sum(w * ag for (_, _, _, ag, _), w in zip(ms, weights)) / sum(weights)
+    team_matches = defaultdict(float)
+    for (h, a, _, _, _), w in zip(ms, weights):
+        team_matches[h] += w; team_matches[a] += w
+    for _ in range(n_iter):
+        att_num = defaultdict(float); att_den = defaultdict(float)
+        def_num = defaultdict(float); def_den = defaultdict(float)
+        for (h, a, hg, ag, _), w in zip(ms, weights):
+            lam_h = avg_home * attack[h] * defence[a] * home_advantage
+            lam_a = avg_away * attack[a] * defence[h]
+            att_num[h] += w * hg;  att_den[h] += w * lam_h / attack[h]
+            att_num[a] += w * ag;  att_den[a] += w * lam_a / attack[a]
+            def_num[a] += w * hg;  def_den[a] += w * lam_h / defence[a]
+            def_num[h] += w * ag;  def_den[h] += w * lam_a / defence[h]
+        for t in teams:
+            shrink_t = shrinkage * (20 / (team_matches[t] + 20))
+            if att_den[t] > 0:
+                attack[t]  = attack[t] * ((att_num[t] / att_den[t]) ** lr)
+                attack[t]  = attack[t] * (1 - shrink_t) + shrink_t
+            if def_den[t] > 0:
+                defence[t] = defence[t] * ((def_num[t] / def_den[t]) ** lr)
+                defence[t] = defence[t] * (1 - shrink_t) + shrink_t
+        att_mean = math.exp(sum(math.log(v) for v in attack.values())  / len(teams))
+        def_mean = math.exp(sum(math.log(v) for v in defence.values()) / len(teams))
+        attack  = {t: v / att_mean for t, v in attack.items()}
+        defence = {t: v / def_mean for t, v in defence.items()}
+    return attack, defence, avg_home, avg_away
+
+
+def fit_rho(matches, attack, defence, avg_home, avg_away, home_advantage):
+    best_rho, best_ll = RHO_DEFAULT, float("-inf")
+    for rho_test in [-0.25, -0.20, -0.18, -0.15, -0.13, -0.10, -0.08, -0.05, 0.0, 0.05]:
+        ll = 0.0
+        for h, a, hg, ag, _ in matches:
+            lh = avg_home * attack.get(h, 1.0) * defence.get(a, 1.0) * home_advantage
+            la = avg_away * attack.get(a, 1.0) * defence.get(h, 1.0)
+            p = (poisson_pmf(hg, lh) * poisson_pmf(ag, la)
+                 * dixon_coles_tau(hg, ag, lh, la, rho_test))
+            if p > 0:
+                ll += math.log(p)
+        if ll > best_ll:
+            best_ll, best_rho = ll, rho_test
+    return best_rho
+
+
+def calibrate_probability(p, strength=0.08):
+    return p * (1 - strength) + 0.5 * strength
+
+
+def poisson_pmf(k, lam):
+    if lam <= 0:
+        return 1.0 if k == 0 else 0.0
+    return math.exp(-lam) * (lam ** k) / math.factorial(k)
+
+
+def nb_pmf(k, mu, phi):
+    """Negative binomial by variance/mean ratio phi. phi<=1 -> Poisson.
+    Corner counts are over-dispersed, so this widens the tails correctly."""
+    if mu <= 0:
+        return 1.0 if k == 0 else 0.0
+    if phi <= 1.0 + 1e-9:
+        return poisson_pmf(k, mu)
+    r = mu / (phi - 1.0)
+    p = r / (r + mu)
+    return math.exp(math.lgamma(k + r) - math.lgamma(r) - math.lgamma(k + 1.0)
+                    + r * math.log(p) + k * math.log(1.0 - p))
+
+
+def dixon_coles_tau(i, j, lh, la, rho=RHO_DEFAULT):
+    if   i == 0 and j == 0: return 1 - lh * la * rho
+    elif i == 1 and j == 0: return 1 + la * rho
+    elif i == 0 and j == 1: return 1 + lh * rho
+    elif i == 1 and j == 1: return 1 - rho
+    else:                   return 1.0
+
+
+def build_score_matrix(lh, la, rho=RHO_DEFAULT, max_goals=7):
+    ph = [poisson_pmf(i, lh) for i in range(max_goals + 1)]
+    pa = [poisson_pmf(j, la) for j in range(max_goals + 1)]
+    m = [[ph[i] * pa[j] * dixon_coles_tau(i, j, lh, la, rho)
+          for j in range(max_goals + 1)] for i in range(max_goals + 1)]
+    tot = sum(m[i][j] for i in range(max_goals + 1) for j in range(max_goals + 1))
+    return [[v / tot for v in row] for row in m]
+
+
+def summarize_matrix(matrix, calibrate=True):
+    n = len(matrix)
+    s = dict.fromkeys(["home", "draw", "away", "over_1_5", "over_2_5",
+                       "over_3_5", "btts_yes", "btts_no"], 0.0)
+    for i in range(n):
+        for j in range(n):
+            p = matrix[i][j]; g = i + j
+            if   i > j:  s["home"] += p
+            elif i == j: s["draw"] += p
+            else:        s["away"] += p
+            if g >= 2: s["over_1_5"] += p
+            if g >= 3: s["over_2_5"] += p
+            if g >= 4: s["over_3_5"] += p
+            if i >= 1 and j >= 1: s["btts_yes"] += p
+            else:                 s["btts_no"]  += p
+    if calibrate:
+        for k in ["home", "draw", "away"]:
+            s[k] = calibrate_probability(s[k])
+        t = s["home"] + s["draw"] + s["away"]
+        if t > 0:
+            s["home"] /= t; s["draw"] /= t; s["away"] /= t
+    return s
+
+
+def prob_to_odds(p):
+    return f"{1/p:.2f}" if p > 0.0001 else "inf"
+
+
+def most_likely_score(matrix):
+    n = len(matrix)
+    best_p, best = 0.0, (0, 0)
+    for i in range(n):
+        for j in range(n):
+            if matrix[i][j] > best_p:
+                best_p, best = matrix[i][j], (i, j)
+    return best, best_p
+
+
+def confidence_flag(lh, la, promoted):
+    if promoted:             return "PRIOR-BASED -- promoted, no 2025-26 PL data"
+    if lh > 3.5 or la > 3.5: return "OVERFITTED -- goals markets only"
+    if lh / max(la, 0.01) > 4 or la / max(lh, 0.01) > 4:
+        return "EXTREME RATIO -- result markets unreliable"
+    if lh + la > 4.5:        return "HIGH-VARIANCE -- goals likely, result uncertain"
+    return "RELIABLE"
+
+
+def print_prediction(home, away, lh, la, ht=None, kickoff=None,
+                     rho=RHO_DEFAULT, promoted=False):
+    matrix = build_score_matrix(lh, la, rho)
+    s = summarize_matrix(matrix)
+    ml, mlp = most_likely_score(matrix)
+    print("=" * 78)
+    print(f"  [Premier League] [{kickoff}]")
+    print(f"  {home}  vs  {away}")
+    print(f"  Confidence: {confidence_flag(lh, la, promoted)}")
+    print(f"  xG  {home}: {lh:.2f}   {away}: {la:.2f}   (rho={rho})")
+    print("-" * 78)
+    print(f"  1X2 :  Home {s['home']*100:5.1f}% ({prob_to_odds(s['home'])})  "
+          f"Draw {s['draw']*100:5.1f}% ({prob_to_odds(s['draw'])})  "
+          f"Away {s['away']*100:5.1f}% ({prob_to_odds(s['away'])})")
+    print(f"  O/U :  O1.5 {s['over_1_5']*100:5.1f}%  O2.5 {s['over_2_5']*100:5.1f}%  "
+          f"O3.5 {s['over_3_5']*100:5.1f}%")
+    print(f"  BTTS:  Yes {s['btts_yes']*100:5.1f}%   No {s['btts_no']*100:5.1f}%")
+    print(f"  Best score: {ml[0]}-{ml[1]}  ({mlp*100:.1f}%)")
+    print(f"  WDW home: {(s['home']+s['draw'])*100:.1f}%   "
+          f"WDW away: {(s['away']+s['draw'])*100:.1f}%")
+    if ht:
+        lhh, lah = ht
+        hm = build_score_matrix(lhh, lah, 0.0, max_goals=5)   # rho=0 at HT
+        hs = summarize_matrix(hm, calibrate=True)
+        print(f"  HT  :  xG {lhh:.2f}/{lah:.2f}   Home {hs['home']*100:4.1f}%  "
+              f"Draw {hs['draw']*100:4.1f}%  Away {hs['away']*100:4.1f}%   "
+              f"O0.5 {(1-hm[0][0])*100:4.1f}%  O1.5 {hs['over_1_5']*100:4.1f}%")
+    print()
+
+
+def print_corner_prediction(home, away, lh, la, phi, kickoff=None, source=""):
+    # Head-to-head ("most corners") needs the joint grid -> independent Poisson.
+    matrix = build_score_matrix(lh, la, 0.0, max_goals=18)
+    n = len(matrix)
+    hm = tie = am = 0.0
+    for i in range(n):
+        for j in range(n):
+            p = matrix[i][j]
+            if   i > j:  hm  += p
+            elif i == j: tie += p
+            else:        am  += p
+    # Totals and team totals -> negative binomial (corners are over-dispersed).
+    mu  = lh + la
+    tot = [nb_pmf(k, mu, phi) for k in range(41)]
+    ou  = {L: sum(p for k, p in enumerate(tot) if k > L)
+           for L in [7.5, 8.5, 9.5, 10.5, 11.5, 12.5]}
+    hk, ak = max(1, int(lh)), max(1, int(la))
+    p_h = sum(nb_pmf(k, lh, phi) for k in range(hk, 41))
+    p_a = sum(nb_pmf(k, la, phi) for k in range(ak, 41))
+    top = sorted(enumerate(tot), key=lambda x: -x[1])[:3]
+    od  = lambda p: f"{1/p:.2f}" if p > 0.0001 else "inf"
+    print("=" * 78)
+    print(f"  [Premier League] [{kickoff}]   CORNERS   ({source})")
+    print(f"  {home}  vs  {away}")
+    print(f"  xCorners  {home}: {lh:.1f}   {away}: {la:.1f}   total: {mu:.1f}"
+          f"   (dispersion phi={phi:.2f})")
+    print("-" * 78)
+    print(f"  Totals:  O8.5 {ou[8.5]*100:4.1f}% ({od(ou[8.5])})   "
+          f"O9.5 {ou[9.5]*100:4.1f}% ({od(ou[9.5])})   "
+          f"O10.5 {ou[10.5]*100:4.1f}% ({od(ou[10.5])})   "
+          f"O11.5 {ou[11.5]*100:4.1f}% ({od(ou[11.5])})")
+    print(f"  Most corners:  {home} {hm*100:4.1f}%   Tie {tie*100:4.1f}%   "
+          f"{away} {am*100:4.1f}%")
+    print(f"  Team totals:  {home} over {hk-0.5:.1f}: {p_h*100:4.1f}% ({od(p_h)})   "
+          f"{away} over {ak-0.5:.1f}: {p_a*100:4.1f}% ({od(p_a)})")
+    print("  Most likely total: " + ", ".join(f"{k} ({p*100:.0f}%)" for k, p in top))
+    print()
+
+
+def print_ratings(att, dff, avg_h, avg_a, rho):
+    print("-" * 78)
+    print(f"  FITTED DIXON-COLES RATINGS  (decay-weighted mean: "
+          f"home {avg_h:.2f} / away {avg_a:.2f}, rho={rho})")
+    print("-" * 78)
+    print(f"  {'TEAM':<24}{'ATT':>8}{'DEF':>8}{'NET':>8}")
+    for t in sorted(att, key=lambda t: -(att[t] / max(dff[t], 0.01))):
+        print(f"  {t:<24}{att[t]:>8.3f}{dff[t]:>8.3f}{att[t]/max(dff[t],0.01):>8.2f}")
+    print()
+
+
+def fetch_corner_matches(competition, season, limit=FETCH_LIMIT):
+    """Corners from football-data.org. Returns [] on the free tier, which is
+    scores only, and real counts if the paid statistics add-on is on the
+    account. The field path could not be tested without the add-on, so if this
+    comes back empty on a paid plan, print a single match detail with
+    api_get(f'/matches/{id}') and adjust the keys below."""
+    try:
+        data = api_get(f"/competitions/{competition}/matches",
+                       {"status": "FINISHED", "season": season, "limit": limit})
+    except Exception as e:
+        print(f"  [corners {season}] API error: {e}")
+        return []
+    out = []
+    for m in data.get("matches", []):
+        stats = m.get("statistics")
+        if not isinstance(stats, dict):
+            continue
+        hs  = stats.get("homeTeam") or stats.get("home") or {}
+        as_ = stats.get("awayTeam") or stats.get("away") or {}
+        hc = hs.get("corners") if isinstance(hs, dict) else None
+        ac = as_.get("corners") if isinstance(as_, dict) else None
+        if hc is None or ac is None:
+            continue
+        out.append((m["homeTeam"].get("shortName") or m["homeTeam"].get("name"),
+                    m["awayTeam"].get("shortName") or m["awayTeam"].get("name"),
+                    int(hc), int(ac), m.get("utcDate", "")))
+    return out
+
+
+def corner_ratings(competition, season, att, dff):
+    """-> (catt, cconc, avg_hc, avg_ac, phi, source)."""
+    cm = list(CORNER_DATA) or fetch_corner_matches(competition, season)
+    if len(cm) >= 10:
+        catt, cconc, avg_hc, avg_ac = fit_team_ratings(
+            cm, home_advantage=HOME_CORNER_ADV, label="corners: ")
+        totals = [h + a for _, _, h, a, _ in cm]
+        mean = sum(totals) / len(totals)
+        var  = sum((t - mean) ** 2 for t in totals) / max(len(totals) - 1, 1)
+        phi  = min(max(var / max(mean, 0.01), 1.0), 2.0)
+        return catt, cconc, avg_hc, avg_ac, phi, f"fitted on {len(cm)} corner matches"
+    # No corner data -> derive corner form from the fitted GOAL ratings.
+    catt  = {t: att[t] ** CORNER_PROXY_BETA for t in att}
+    cconc = {t: dff[t] ** CORNER_PROXY_BETA for t in dff}
+    return (catt, cconc, CORNER_BASE, CORNER_BASE, CORNER_DISPERSION,
+            "GOAL-RATING PROXY -- no corner data on this plan")
+
+
+def main():
+    print("=" * 78)
+    print(f"  PREMIER LEAGUE  |  analyse {SEASON}-{SEASON+1} in full, "
+          f"then predict matchday 1 of {SEASON+1}-{SEASON+2}")
+    print("=" * 78)
+
+    # ---------------- STAGE 1: analyse every match of last season -------------
+    recs = fetch_season(COMPETITION, SEASON)
+    if len(recs) < MIN_MATCHES:
+        print(f"\n  Only {len(recs)} matches -- below MIN_MATCHES={MIN_MATCHES}.")
+        print("  Ratings would be meaningless. Check the season param / API plan.")
+        return
+    export_csv(recs, EXPORT_CSV)
+    table = analyse_season(recs)
+    print_season_report(recs, table)
+
+    # ---------------- STAGE 2: fit those matches and apply -------------------
+    gv = goals_view(recs)
+    att, dff, avg_h, avg_a = fit_team_ratings(gv, HOME_ADV, label="goals: ")
+    rho = fit_rho(gv, att, dff, avg_h, avg_a, HOME_ADV)
+    print_ratings(att, dff, avg_h, avg_a, rho)
+
+    hv = halftime_view(recs)
+    ht_ok = len(hv) >= MIN_MATCHES
+    if ht_ok:
+        h_att, h_dff, h_avg_h, h_avg_a = fit_team_ratings(hv, HOME_ADV, label="half-time: ")
+    else:
+        print(f"  Half-time scores on only {len(hv)} matches -> HT markets skipped.\n")
+
+    data_teams = sorted({r["home"] for r in recs} | {r["away"] for r in recs})
+    names = {t for f in FIXTURES for t in (f[0], f[1])}
+    name_map, missing = {}, []
+    print("  NAME RESOLUTION")
+    for nm in sorted(names):
+        hit, how = resolve(nm, data_teams)
+        if hit:
+            name_map[nm] = hit
+            if _flat(nm) != _flat(hit):
+                print(f"    {nm:<24} -> {hit:<18} [{how}]")
+        else:
+            missing.append(nm)
+            print(f"    {nm:<24} -> PRIOR             [{how}]")
+    print()
+
+    def ratings_for(name, a_tbl, d_tbl):
+        key = name_map.get(name)
+        if key is None:
+            return PROMOTED_ATT, PROMOTED_DEF, True
+        return a_tbl.get(key, PROMOTED_ATT), d_tbl.get(key, PROMOTED_DEF), False
+
+    def lam(home, away, a_tbl, d_tbl, base_h, base_a):
+        h_att, h_def, h_new = ratings_for(home, a_tbl, d_tbl)
+        a_att, a_def, a_new = ratings_for(away, a_tbl, d_tbl)
+        return (round(base_h * h_att * a_def * HOME_ADV, 3),
+                round(base_a * a_att * h_def, 3),
+                h_new or a_new)
+
+    print("=" * 78)
+    print("  STAGE 2 -- MATCHDAY 1 PREDICTIONS: GOALS")
+    print("=" * 78)
+    for home, away, ko in FIXTURES:
+        lh, la, is_new = lam(home, away, att, dff, avg_h, avg_a)
+        ht = None
+        if ht_ok:
+            hlh, hla, _ = lam(home, away, h_att, h_dff, h_avg_h, h_avg_a)
+            ht = (hlh, hla)
+        print_prediction(home, away, lh, la, ht=ht, kickoff=ko,
+                         rho=rho, promoted=is_new)
+
+    catt, cconc, c_h, c_a, phi, csrc = corner_ratings(COMPETITION, SEASON, att, dff)
+    print("=" * 78)
+    print(f"  STAGE 2 -- MATCHDAY 1 PREDICTIONS: CORNERS   ({csrc})")
+    print("=" * 78)
+    pa_c, pd_c = PROMOTED_ATT ** CORNER_PROXY_BETA, PROMOTED_DEF ** CORNER_PROXY_BETA
+    for home, away, ko in FIXTURES:
+        h_ca, h_cd, h_new = ratings_for(home, catt, cconc)
+        a_ca, a_cd, a_new = ratings_for(away, catt, cconc)
+        if h_new: h_ca, h_cd = pa_c, pd_c
+        if a_new: a_ca, a_cd = pa_c, pd_c
+        lhc = round(c_h * h_ca * a_cd * HOME_CORNER_ADV, 3)
+        lac = round(c_a * a_ca * h_cd, 3)
+        print_corner_prediction(home, away, lhc, lac, phi, kickoff=ko, source=csrc)
+
+
+if __name__ == "__main__":
+    main()
