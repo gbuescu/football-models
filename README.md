@@ -31,9 +31,11 @@ The standard general model. Dixon-Coles goals model with a corners predictor on
 top. Outputs 1X2, over/under 1.5, 2.5 and 3.5, both teams to score, the most
 likely scoreline, double chance, and corner markets. It is the only script that
 can read real corner counts from a second API if you have a key for one. Set
-the competition code in `main()`. It fits the current season only, with no
-previous season and no priors, so it is the weakest of the four early in a
-season.
+the competition code in `main()`. Like the league scripts, it fits last season
+plus the current one so far, and gives sides new this season a fading
+weak-side prior. That prior is generic rather than measured for your league,
+and it suits a top division: in a second division the new sides include
+relegated clubs, which it underrates.
 
 ### `pl_model.py`
 
@@ -174,18 +176,19 @@ Champions League matchday over an international break. To predict specific
 games instead, list them in `FIXTURES` near the top of the file (`CL_FIXTURES`
 and `ELC_FIXTURES` in `cl_corners_model.py`).
 
-The settings worth knowing about are the season constants, which are keyed by
-the season's starting year, so 2025 means the 2025-26 season. `SEASON` in the
-league scripts is the last completed season, and the current one
-(`SEASON + 1`) is fitted alongside it. `ELC_SEASON` and `CL_SEASON` in
-`cl_corners_model.py` are the seasons in progress. Bump all of them each
-August, and set them explicitly. Leaving the season out asks the API for the
-current season, which in August has no finished matches, and the scripts will
-quietly rate every team as average instead of failing.
+Seasons are keyed by their starting year, so 2025 means the 2025-26 season.
+The scripts work them out from today's date: from June, the next season counts
+as current. In the league scripts `SEASON` is the last completed season, and
+the current one (`SEASON + 1`) is fitted alongside it. Set `SEASON` to a year
+to analyse an older season. `regular_prediction_model.py` assumes an
+August-to-May season, so pin its `SEASON` for a calendar-year league. The
+season is always passed to the API explicitly. Leaving it out asks for the
+current season, which in August has no finished matches, and every team would
+quietly be rated as average.
 
 The free tier allows 10 requests a minute. `cl_corners_model.py` makes 9 or 10
-a run and waits out the limit if it hits it. The league scripts make fewer, but
-don't retry, so leave a minute between back-to-back runs.
+a run and the others 3 or 4. If a script hits the limit, it waits for it to
+reset and retries, so back-to-back runs are slower but complete.
 
 `SETUP.md` covers the same ground with a smoke test, and is the one to follow
 on a fresh clone.

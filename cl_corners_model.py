@@ -27,7 +27,7 @@ import urllib.request
 import json
 import sys
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 
 def _load_api_key(var="FOOTBALL_DATA_KEY", required=True):
@@ -79,6 +79,14 @@ def api_get(endpoint, params=None):
             return json.loads(resp.read())
 
 
+def current_season(today=None):
+    """Starting year of the season in progress, as football-data.org keys seasons
+    (2026 = 2026-27). From June the next season counts as current: the last one is
+    over and the new one has no finished matches yet. Assumes an August-May season."""
+    today = today or date.today()
+    return today.year if today.month >= 6 else today.year - 1
+
+
 DAYS_AHEAD = 7   # fixture window in days; override with --days N
 
 # Fixtures come from the API: every scheduled match in the next DAYS_AHEAD days. To
@@ -90,7 +98,7 @@ ELC_FIXTURES = []
 # The Championship is a league, so it is fitted the way the league scripts are: the
 # previous season plus the current one so far, time-decayed, with a fitted rho. In the
 # club backtest this beat a current-season-only fit (docs/MODEL_CHANGES.md).
-ELC_SEASON       = 2026     # season in progress (starting year); bump each August
+ELC_SEASON       = current_season()   # season in progress (starting year), from today's date
 ELC_DECAY        = 0.0035
 # Priors for sides new to the division: their ratings start here and are shrunk back
 # toward them (not toward average) until their own results take over. Measured on
@@ -110,7 +118,7 @@ PRIOR_GAMES = 5   # a newcomer's prior fades as it plays, worth about this many 
 # 2024-25 and 2025-26 and stable across both. Newcomers from the big five stay
 # average: a prior for them was not reliably better (docs/MODEL_CHANGES.md). Each team's
 # country comes from the CL team list.
-CL_SEASON = 2026     # season in progress (starting year); bump each August
+CL_SEASON = current_season()   # season in progress (starting year), from today's date
 CL_HISTORY = 3       # previous CL seasons fitted (the free tier serves 2023-24 onward)
 CL_BIG5 = {"England", "Spain", "Germany", "Italy", "France"}
 CL_LEAGUE_COUNTRY = {"Monaco": "France"}     # AS Monaco plays in Ligue 1

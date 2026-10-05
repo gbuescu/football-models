@@ -127,8 +127,8 @@ club will silently fall back to the promoted-side prior.
 If the API is unreachable the scripts say so and carry on with neutral ratings
 rather than crashing. That output is not meaningful, so do not read predictions
 from a run that reported an API error. The usual cause is the rate limit of 10
-requests a minute. `cl_corners_model.py` waits for the limit to reset and
-retries, but the other scripts don't, so leave a minute between runs.
+requests a minute. The scripts wait for the limit to reset and retry once, so
+an error here usually means the API is down or the key is wrong.
 
 ## Backtest
 

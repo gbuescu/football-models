@@ -80,6 +80,10 @@ CONFIGS = [
     ("ELC: current season only", "E1", "cl_corners_model", "current_only"),
     ("PL: two seasons, old prior", "E0", "pl_model", "two_seasons_old_prior"),
     ("PPL: two seasons, old prior", "P1", "liga_portugal_model", "two_seasons_old_prior"),
+    ("PL: regular_prediction_model.py", "E0", "regular_prediction_model", "regular"),
+    ("PPL: regular_prediction_model.py", "P1", "regular_prediction_model", "regular"),
+    ("PL: regular, current season only (old)", "E0", "regular_prediction_model", "regular_old"),
+    ("PPL: regular, current season only (old)", "P1", "regular_prediction_model", "regular_old"),
 ]
 THRESHOLDS = (0.0, 0.05, 0.10)   # minimum model edge (EV at the early price) to bet
 OLD_NEWCOMER_PRIOR = (0.80, 1.20)  # what every new Championship side got before 2026-10-04
@@ -227,6 +231,21 @@ def predict_week(module, method, history, before, week, priors=None):
             team_prior = lambda t: priors.get(t, (module.PROMOTED_ATT, module.PROMOTED_DEF))
         else:
             prior_att, prior_def = OLD_NEWCOMER_PRIOR
+    elif method == "regular":   # the standard model: two seasons, its generic newcomer prior
+        gv = [(m.home, m.away, m.hg, m.ag, m.day.isoformat()) for m in history + before]
+        with contextlib.redirect_stdout(io.StringIO()):
+            att, dff, avg_h, avg_a = module.fit_team_ratings(gv, priors=priors)
+            rho = module.fit_rho(gv, att, dff, avg_h, avg_a, 1.0)
+        prior_att, prior_def = module.NEWCOMER_ATT, module.NEWCOMER_DEF
+    elif method == "regular_old":   # the standard model before: current season only
+        if len(before) >= 10:
+            gv = [(m.home, m.away, m.hg, m.ag, m.day.isoformat()) for m in before]
+            with contextlib.redirect_stdout(io.StringIO()):
+                att, dff, avg_h, avg_a = module.fit_team_ratings(gv, priors={})
+                rho = module.fit_rho(gv, att, dff, avg_h, avg_a, 1.0)
+        else:
+            att, dff, avg_h, avg_a, rho = {}, {}, 1.50, 1.15, -0.13
+        prior_att = prior_def = 1.0
     elif method == "league":   # cl_corners_model's Championship fit, with division priors
         gv = [(m.home, m.away, m.hg, m.ag, m.day.isoformat()) for m in history + before]
         att, dff, avg_h, avg_a = module.fit_league_ratings(gv, priors=priors)
@@ -271,6 +290,9 @@ def run_config(config):
         elif method == "two_seasons":
             value = promoted_priors(by_season, exclude=season)
             priors = {t: value for t in teams_of(current) - teams_of(by_season[prev])}
+        elif method == "regular":   # a fixed generic prior, not measured per league
+            priors = {t: (module.NEWCOMER_ATT, module.NEWCOMER_DEF)
+                      for t in teams_of(current) - teams_of(by_season[prev])}
         for monday in sorted({m.day - timedelta(days=m.day.weekday()) for m in current}):
             before = [m for m in current if m.day < monday]
             week = [m for m in current if monday <= m.day < monday + timedelta(days=7)]
@@ -378,7 +400,10 @@ def main():
            "- **Promoted, relegated or unseen teams:** the deployed configs use the scripts' measured, fading "
            "priors (promoted sides in the league scripts; relegated and promoted sides in the Championship), "
            "re-measured with each test season left out. The \"old prior\" rows use the former 0.80/1.20 "
-           "judgment call.",
+           "judgment call. `regular_prediction_model.py` uses its fixed generic newcomer prior "
+           "(0.73/1.16, between the measured PL and Primeira Liga values, so not out of sample for those "
+           "two leagues); its \"old\" rows are the script before 2026-10-05, fitted on the current season "
+           "only with unseen sides at 1.0.",
            "- **Market:** Pinnacle. The *early* price (PSH/PSD/PSA, P>2.5/P<2.5) is collected on Friday for "
            "weekend games and Tuesday for midweek, which is when you would run the scripts. The *closing* price is "
            "PSCH/PSCD/PSCA and PC>2.5/PC<2.5. Margins are removed proportionally to get fair probabilities.",
@@ -447,7 +472,15 @@ def main():
             ("division priors − old 0.80/1.20 prior, all matches", "ELC: cl_corners_model.py",
              "ELC: two seasons, old prior", lambda m: True),
             ("division priors − old prior, matches with a relegated/promoted side, first 10 weeks",
-             "ELC: cl_corners_model.py", "ELC: two seasons, old prior", early_newcomer)]
+             "ELC: cl_corners_model.py", "ELC: two seasons, old prior", early_newcomer),
+            ("regular: two seasons + newcomer prior − old current-season-only fit, PL",
+             "PL: regular_prediction_model.py", "PL: regular, current season only (old)", lambda m: True),
+            ("regular: same, PL, first 10 weeks of each season", "PL: regular_prediction_model.py",
+             "PL: regular, current season only (old)", early({s: teams_of(e0[s]) for s in SEASONS[1:]}, e0)),
+            ("regular: two seasons + newcomer prior − old current-season-only fit, PPL",
+             "PPL: regular_prediction_model.py", "PPL: regular, current season only (old)", lambda m: True),
+            ("regular: same, PPL, first 10 weeks of each season", "PPL: regular_prediction_model.py",
+             "PPL: regular, current season only (old)", early({s: teams_of(p1[s]) for s in SEASONS[1:]}, p1))]
     out += ["", "**Model-change comparisons (per-match log loss over all test matches; negative = first is better; "
             "ELC rows compare Championship versions):**", "",
             "| Comparison | Matches | Δ 1X2 (t) | Δ O/U 2.5 (t) |", "|---|---|---|---|"]

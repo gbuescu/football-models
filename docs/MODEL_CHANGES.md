@@ -17,11 +17,12 @@ calibrated and stop them failing silently. They do not make them profitable.
 | Home advantage applied once, not twice | all four | in-sample PL home goals 1.55 predicted vs 1.53 observed (was 1.86) |
 | Zero-goal collapse fixed (pseudo-goal, floor, shrinkage) | all four | the CL script crashed after matchday 1; now runs |
 | CL/ELC fixture names resolved, with warnings | `cl_corners_model.py` | 3 of 8 CL names silently got neutral ratings |
-| Last season plus the current one fitted | all but `regular_prediction_model.py` | Championship 1X2 −0.0099 (t −3.7); CL 1X2 −0.044 (t −6.3) |
+| Last season plus the current one fitted | all four | Championship 1X2 −0.0099 (t −3.7); CL 1X2 −0.044 (t −6.3); standard model PL −0.044 (t −10.0) |
 | Fixtures fetched from the API | all four | — |
 | Measured, fading priors for new sides | `pl_model.py`, `liga_portugal_model.py`, `cl_corners_model.py` | PL 1X2 −0.0058 (t −4.4); Championship −0.0034 (t −3.2); CL −0.022 (t −2.4) |
 | Longer CL history for returning clubs | `cl_corners_model.py` | partly validated, see section 7 |
 | Club backtest against Pinnacle odds | `club_backtest.py` | no edge, see section 9 |
+| Seasons from today's date; rate-limit retry everywhere | all four | see section 10 |
 
 ## 1. Home advantage applied once
 
@@ -167,7 +168,7 @@ The free tier allows 10 requests a minute. `cl_corners_model.py` now makes 9 a r
 - **Rate limit:** if the limit is hit, the script waits for the counter to reset and retries once.
   Before, the error was caught and the script silently fitted without that season.
 
-The league scripts make 2 to 6 requests a run and don't retry, so space out back-to-back runs.
+The other scripts make 3 or 4 requests a run, and since section 10 they retry the same way.
 
 ## 9. Club backtest
 
@@ -190,6 +191,43 @@ earlier matches only, using each script's own fitting and scoring code.
   across leagues before anyone stakes money on it.
 - **Not testable:** there are no free CL odds, so the CL fit can't be tested against the market.
 
+## 10. Seasons, rate limits and the standard model
+
+**Seasons follow today's date.** The season constants used to need bumping every August, and
+forgetting gave no error. Each script now has `current_season()`, which returns the starting year of
+the season in progress, or of the next one from June. The league scripts' `SEASON` is the last
+completed season, and `cl_corners_model.py`'s `ELC_SEASON` and `CL_SEASON` are the current one. Every
+API request still passes the season explicitly. Pin any of them to a year to override.
+
+**API fixtures resolve by exact name.** Fixtures fetched from the API carry the data's own team
+names, so the league scripts now match them exactly and never by shared words. A name with no data is
+a side with no match yet, and it gets the promoted prior. The hand-kept `PROMOTED` lists now only
+matter for hand-typed fixtures. `liga_portugal_model.py`'s word matcher had no promoted guard at all,
+so this closes a real gap there.
+
+**Rate-limit retry in every script.** The league scripts and the standard model used to catch every
+API error and carry on without that season's data. All four now wait for the limit to reset and
+retry once.
+
+**`regular_prediction_model.py` brought up to the league scripts' fit.**
+- **What it was missing:** it fetched matches with no season parameter, so it fitted the current
+  season only. It had no prior for new sides, and hand-typed fixture names had to match exactly.
+- **What it does now:**
+  - **Seasons:** it fits last season plus the current one, time-decayed.
+  - **New sides:** a side with no match last season starts from a fading prior,
+    `NEWCOMER_ATT/DEF` = 0.73/1.16, between the measured Premier League and Liga Portugal values.
+  - **Names:** hand-typed names resolve exactly, accent-insensitively or via `ALIASES`, with a
+    warning if they don't.
+
+| Club backtest, 1X2 log loss | Before | After | Δ (t) | League script |
+|---|---|---|---|---|
+| Premier League | 1.0327 | 0.9854 | −0.044 (−10.0) | 0.9847 |
+| Liga Portugal | 1.0394 | 0.9570 | −0.081 (−14.8) | 0.9571 |
+
+- **Where the gain comes from:** almost all of it is the second season. The prior's values come from
+  these two leagues, so that part is not an out-of-sample test.
+- **Against the market:** like every model here, it has negative closing-line value.
+
 ## Known limitations
 
 - **No edge.** See section 9.
@@ -197,9 +235,8 @@ earlier matches only, using each script's own fitting and scoring code.
   out too generous. Strong clubs new to the window from strong non-big-five leagues, such as
   Fenerbahçe, are rated like minnows until they have played a few games. A proper fix needs outside
   data such as UEFA coefficients. Treat early-league-phase CL prices on those sides with caution.
-- **`regular_prediction_model.py` is the simplest script.** It fits the current season only, with no
-  previous season and no priors, so it is weakest early in a season.
+- **`regular_prediction_model.py` uses a generic newcomer prior.** It isn't measured for your
+  league, and in a second division it underrates relegated clubs.
 - **Corners are a goal-rating proxy** unless you have paid corner data.
-- **Season constants are manual.** Bump `SEASON` (league scripts), `ELC_SEASON` and `CL_SEASON` each
-  August. Update the `PROMOTED` name lists in the league scripts too, because they guard name
-  resolution.
+- **Hand-typed fixtures** still rely on the `PROMOTED` name lists in the league scripts. Update them
+  each summer if you type fixtures in rather than fetching them.

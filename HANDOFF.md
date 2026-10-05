@@ -61,14 +61,17 @@ could not be tested. If it returns empty on a paid plan, dump
 
 ## Decisions that are deliberate
 
-**`SEASON` must be explicit.** football-data.org keys a season by its starting
-year, so `2025` is the 2025-26 season. Requesting without the parameter returns
-the current season, which in August has zero finished matches and silently
-produces neutral 1.0 ratings for everyone. This is the easiest way to get
-confident-looking rubbish out of these scripts. In the league scripts `SEASON`
-is the last completed season and `CURRENT = SEASON + 1` is fitted alongside
-it. In `cl_corners_model.py`, `ELC_SEASON` and `CL_SEASON` are the seasons in
-progress. All of them need bumping each August.
+**The season is always explicit.** football-data.org keys a season by its
+starting year, so `2025` is the 2025-26 season. Requesting without the
+parameter returns the current season, which in August has zero finished
+matches and silently produces neutral 1.0 ratings for everyone. This is the
+easiest way to get confident-looking rubbish out of these scripts, so every
+request passes a season. The seasons come from today's date via
+`current_season()`: from June, the next season counts as current. In the
+league scripts `SEASON` is the last completed season and
+`CURRENT = SEASON + 1` is fitted alongside it. In `cl_corners_model.py`,
+`ELC_SEASON` and `CL_SEASON` are the seasons in progress. Pin any of them to a
+year to override.
 
 **Promoted-side priors.** Newly promoted clubs appear nowhere in last season's
 top-flight data. Rating them a neutral 1.0 would put them mid-table, so they
@@ -88,7 +91,10 @@ as Manchester City while printing `RELIABLE`. Three guards, all load-bearing:
 promoted clubs (the `PROMOTED` names) resolve by alias or exact name only and
 never reach token matching, an explicit `ALIASES` table does the real work, and
 a match on a weak token alone ("city", "united", "town", "albion") is rejected
-rather than guessed. Keep all three.
+rather than guessed. Fixtures fetched from the API use the data's own names, so
+they skip token matching altogether. A name with no exact match there is a side
+with no match yet and gets the promoted prior. The `PROMOTED` lists therefore
+only matter for hand-typed fixtures. Keep all three.
 Removing any one brings back silent, confident-looking errors.
 
 **Negative binomial for corner totals.** Corner counts are over-dispersed and

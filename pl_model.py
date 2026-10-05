@@ -24,7 +24,8 @@ Two things that look like fussiness but are not:
 Season keys. football-data.org keys a season by its starting year, so 2025 is
 2025-26. Requesting without the season parameter returns the current season,
 which in August has no finished matches and quietly leaves every team on a
-neutral 1.0 rating. Hence SEASON is always explicit.
+neutral 1.0 rating. Hence the season is always passed explicitly, worked out
+from today's date (current_season).
 
 Name resolution. Token matching is genuinely dangerous in this league.
 "Manchester United" shares 'united' with Leeds United, and both Coventry City
@@ -42,10 +43,12 @@ import json
 import math
 import os
 import sys
+import time
 import unicodedata
+import urllib.error
 import urllib.request
 from collections import defaultdict, Counter
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 
 def _load_api_key(var="FOOTBALL_DATA_KEY", required=True):
@@ -74,12 +77,22 @@ def _load_api_key(var="FOOTBALL_DATA_KEY", required=True):
     )
 
 
+def current_season(today=None):
+    """Starting year of the season in progress, as football-data.org keys seasons
+    (2026 = 2026-27). From June the next season counts as current: the last one is
+    over and the new one has no finished matches yet. Assumes an August-May season."""
+    today = today or date.today()
+    return today.year if today.month >= 6 else today.year - 1
+
+
 API_KEY  = _load_api_key()
 BASE_URL    = "https://api.football-data.org/v4"
 COMPETITION = "PL"           # Premier League (free tier)
 
-SEASON      = 2025           # last completed season (starting year, so 2025-26)
-CURRENT     = SEASON + 1     # season in progress: its finished matches are fitted too
+# Seasons follow today's date (current_season): SEASON is the last completed one and
+# CURRENT the one in progress. To analyse an older season, pin it, e.g. SEASON = 2024.
+SEASON      = current_season() - 1   # last completed season (starting year: 2025 = 2025-26)
+CURRENT     = SEASON + 1             # season in progress: its finished matches are fitted too
 DAYS_AHEAD  = 7              # fixture window in days; override with --days N
 FETCH_LIMIT = 400            # a 20-team season is exactly 380, with margin added
 MIN_MATCHES = 40             # below this the ratings are meaningless
@@ -99,9 +112,12 @@ RHO_DEFAULT = -0.13          # Dixon-Coles low-score correction
 PROMOTED_ATT = 0.69
 PROMOTED_DEF = 1.25
 PRIOR_GAMES  = 5      # the prior is worth about this many games of the side's own results
+# Hand-typed FIXTURES only: these display names never reach token matching. API
+# fixtures need no list, since a name with no exact match is a side with no match
+# yet. Update it each summer if you type fixtures in by hand.
 PROMOTED     = {"Coventry City", "Ipswich Town", "Hull City"}   # up for 2026-27
 
-EXPORT_CSV   = "premier_league_2025_26_matches.csv"
+EXPORT_CSV   = f"premier_league_{SEASON}_{(SEASON + 1) % 100:02d}_matches.csv"
 
 CORNER_BASE       = 5.1    # about 10.2 in total, the league's rough long-run average
 CORNER_PROXY_BETA = 0.6    # damping when deriving corner form from goal form
@@ -140,8 +156,19 @@ def api_get(endpoint, params=None):
     if params:
         url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
     req = urllib.request.Request(url, headers={"X-Auth-Token": API_KEY})
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code != 429:
+            raise
+        # Over the free tier's 10 requests a minute: wait for the counter to reset and
+        # retry once, rather than silently fitting without a season.
+        wait = int(e.headers.get("X-RequestCounter-Reset") or 60) + 1
+        print(f"  [rate limit] waiting {wait}s...")
+        time.sleep(wait)
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
 
 
 def fetch_season(competition, season, limit=FETCH_LIMIT):
@@ -343,10 +370,11 @@ def _tokens(name):
     return [t for t in s.split() if t and t not in STOPWORDS]
 
 
-def resolve(name, data_teams):
+def resolve(name, data_teams, exact_only=False):
     """-> (api_name | None, how). Aliases and exact names do the real work;
     promoted clubs never reach token matching; weak-token-only matches are
-    rejected, never guessed."""
+    rejected, never guessed. exact_only: the names come from the API, so one with
+    no exact match is a side with no match yet (promoted), not a spelling to guess."""
     flat = {}
     for t in data_teams:
         flat.setdefault(_flat(t), t)
@@ -354,7 +382,7 @@ def resolve(name, data_teams):
         hit = flat.get(_flat(cand))
         if hit:
             return hit, "alias"
-    if name in PROMOTED:
+    if name in PROMOTED or exact_only:
         return None, "promoted"
     qt = _tokens(name)
     scored = []
@@ -713,7 +741,7 @@ def main():
     name_map, missing = {}, []
     print("  NAME RESOLUTION")
     for nm in sorted(names):
-        hit, how = resolve(nm, data_teams)
+        hit, how = resolve(nm, data_teams, exact_only=not FIXTURES)
         if hit:
             name_map[nm] = hit
             if _flat(nm) != _flat(hit):
