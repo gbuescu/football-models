@@ -4,14 +4,18 @@ A Dixon-Coles goals model with a corners predictor on top. This is the base
 version the league-specific scripts are refined from, and the one to start
 with for a competition that has no script of its own.
 
-Set the competition code and the fixture list in main(). Standard library only.
+Set the competition code in main(). Fixtures come from the API (every scheduled
+match in the next DAYS_AHEAD days, or --days N) unless FIXTURES lists specific
+games. Standard library only.
 """
 
 import math
 import os
+import sys
 import urllib.request
 import json
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
 
 def _load_api_key(var="FOOTBALL_DATA_KEY", required=True):
@@ -51,6 +55,37 @@ def api_get(endpoint, params=None):
     with urllib.request.urlopen(req) as resp:
         return json.loads(resp.read())
 
+DAYS_AHEAD = 7   # fixture window in days; override with --days N
+FIXTURES   = []  # optional manual list: ("Home Team", "Away Team", "Kickoff"), API names
+
+def days_ahead():
+    """--days N on the command line, else DAYS_AHEAD."""
+    if "--days" in sys.argv[1:-1]:
+        return int(sys.argv[sys.argv.index("--days") + 1])
+    return DAYS_AHEAD
+
+def fetch_fixtures(competition, days):
+    """Scheduled matches from today through `days` days ahead -> [(home, away,
+    kickoff), ...], kickoff in local time, names as the API spells them."""
+    start = datetime.now(timezone.utc).date()
+    try:
+        data = api_get(f"/competitions/{competition}/matches",
+                       {"dateFrom": start.isoformat(),
+                        "dateTo": (start + timedelta(days=days)).isoformat()})
+    except Exception as e:
+        print(f"  [{competition} fixtures] API error: {e}")
+        return []
+    out = []
+    for m in data.get("matches", []):
+        home = m["homeTeam"].get("shortName") or m["homeTeam"].get("name")
+        away = m["awayTeam"].get("shortName") or m["awayTeam"].get("name")
+        if m.get("status") not in ("SCHEDULED", "TIMED") or not home or not away:
+            continue
+        ko = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00")).astimezone()
+        out.append((home, away, ko.strftime("%a %d %b %H:%M")))
+    print(f"  [{competition}] {len(out)} scheduled fixtures in the next {days} days.")
+    return out
+
 def fetch_finished_matches(competition, limit=380):
     try:
         data = api_get(f"/competitions/{competition}/matches",
@@ -77,7 +112,7 @@ def auto_shrinkage(n_matches):
     elif n_matches < 300:  return 0.05
     else:                  return 0.03
 
-def fit_team_ratings(matches, home_advantage=1.35, n_iter=300, lr=0.01,
+def fit_team_ratings(matches, home_advantage=1.0, n_iter=300, lr=0.01,
                      decay=0.0035, shrinkage=None):
     if shrinkage is None:
         shrinkage = auto_shrinkage(len(matches))
@@ -107,11 +142,13 @@ def fit_team_ratings(matches, home_advantage=1.35, n_iter=300, lr=0.01,
             def_num[h] += w * ag;  def_den[h] += w * lam_a / defence[h]
         for t in teams:
             shrink_t = shrinkage * (20 / (team_matches[t] + 20))
+            # One pseudo-goal at the expected rate: (0/x)**lr is 0 for any lr, so a side on
+            # 0 goals (e.g. promoted, one game in) would collapse (docs/MODEL_CHANGES.md).
             if att_den[t] > 0:
-                attack[t]  = attack[t] * ((att_num[t] / att_den[t]) ** lr)
+                attack[t]  = attack[t] * (((att_num[t] + 1) / (att_den[t] + 1)) ** lr)
                 attack[t]  = attack[t] * (1 - shrink_t) + shrink_t
             if def_den[t] > 0:
-                defence[t] = defence[t] * ((def_num[t] / def_den[t]) ** lr)
+                defence[t] = defence[t] * (((def_num[t] + 1) / (def_den[t] + 1)) ** lr)
                 defence[t] = defence[t] * (1 - shrink_t) + shrink_t
         att_mean = math.exp(sum(math.log(v) for v in attack.values())  / len(teams))
         def_mean = math.exp(sum(math.log(v) for v in defence.values()) / len(teams))
@@ -312,25 +349,28 @@ def print_corner_prediction(home, away, lh, la, league=None, kickoff=None):
 
 def main():
     # Competition codes: PL, ELC, PD, BL1, SA, FL1, CL, EL, EC, PPL
-    matches = fetch_finished_matches("PL")
+    COMPETITION, LEAGUE = "PL", "Premier League"
+    # Home advantage is applied once: avg_h / avg_a are the competition's own home and
+    # away goal averages, so they already carry it (docs/MODEL_CHANGES.md).
+    matches = fetch_finished_matches(COMPETITION)
     if len(matches) >= 10:
-        att, dff, avg_h, avg_a = fit_team_ratings(matches, home_advantage=1.20)
-        rho = fit_rho(matches, att, dff, avg_h, avg_a, 1.20)
+        att, dff, avg_h, avg_a = fit_team_ratings(matches)
+        rho = fit_rho(matches, att, dff, avg_h, avg_a, 1.0)
         print(f"  Best rho: {rho}")
     else:
         att, dff, avg_h, avg_a, rho = {}, {}, 1.50, 1.15, -0.13
 
-    def lam(home, away, ha=1.20):
+    def lam(home, away):
         h_att = att.get(home, 1.0); h_def = dff.get(home, 1.0)
         a_att = att.get(away, 1.0); a_def = dff.get(away, 1.0)
-        return round(avg_h * h_att * a_def * ha, 3), round(avg_a * a_att * h_def, 3)
+        return round(avg_h * h_att * a_def, 3), round(avg_a * a_att * h_def, 3)
 
-    fixtures = [
-        # ("Home Team", "Away Team", "Kickoff"),
-    ]
+    fixtures = FIXTURES or fetch_fixtures(COMPETITION, days_ahead())
+    if not fixtures:
+        print(f"  No scheduled {COMPETITION} fixtures in the window (international break?). Try --days 14.")
     for home, away, ko in fixtures:
         lh, la = lam(home, away)
-        print_prediction(home, away, lh, la, league="Premier League", kickoff=ko, rho=rho)
+        print_prediction(home, away, lh, la, league=LEAGUE, kickoff=ko, rho=rho)
 
     print("#" * 72)
     print("#  CORNERS")
@@ -338,24 +378,26 @@ def main():
     HOME_CORNER_ADV = 1.10   # home sides win slightly more corners
     cmatches = CORNER_DATA or fetch_corner_matches()
     if cmatches and len(cmatches) >= 10:
-        catt, cconc, avg_hc, avg_ac = fit_team_ratings(
-            cmatches, home_advantage=HOME_CORNER_ADV)
+        # Fitted home/away corner averages already carry the home edge.
+        catt, cconc, avg_hc, avg_ac = fit_team_ratings(cmatches)
+        c_ha = 1.0
         print(f"  Corner model: fitted on {len(cmatches)} corner records\n")
     else:
         catt  = {t: att.get(t, 1.0) ** CORNER_PROXY_BETA for t in att}
         cconc = {t: dff.get(t, 1.0) ** CORNER_PROXY_BETA for t in dff}
         avg_hc = avg_ac = CORNER_BASE
+        c_ha = HOME_CORNER_ADV   # neutral base, so the home edge is applied here, once
         print("  Corner model: GOAL-RATING PROXY (no corner data supplied)\n")
 
     def clam(home, away):
         h_catt = catt.get(home, 1.0); h_ccon = cconc.get(home, 1.0)
         a_catt = catt.get(away, 1.0); a_ccon = cconc.get(away, 1.0)
-        return (round(avg_hc * h_catt * a_ccon * HOME_CORNER_ADV, 3),
+        return (round(avg_hc * h_catt * a_ccon * c_ha, 3),
                 round(avg_ac * a_catt * h_ccon, 3))
 
     for home, away, ko in fixtures:
         lhc, lac = clam(home, away)
-        print_corner_prediction(home, away, lhc, lac, league="Premier League", kickoff=ko)
+        print_corner_prediction(home, away, lhc, lac, league=LEAGUE, kickoff=ko)
 
 if __name__ == "__main__":
     main()

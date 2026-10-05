@@ -2,20 +2,32 @@
 
 A cut-down variant for knockout and cup competitions, where a full league
 season's worth of matches does not exist. Deliberately simpler than the league
-scripts: no time-decay, no shrinkage, no half-time model, and a plain Poisson
-tail on corner totals rather than a negative binomial. It also prints a small
-correct-score grid, which the league scripts do not.
+scripts: no time-decay, no half-time model, and a plain Poisson tail on corner
+totals rather than a negative binomial. It also prints a small correct-score
+grid, which the league scripts do not.
 
 Small samples mean the ratings here overfit more than the league versions do.
-Treat the goals markets as more trustworthy than the result markets.
+Treat the goals markets as more trustworthy than the result markets. Since
+2026-10-04 (docs/MODEL_CHANGES.md): ratings use the league scripts' sample-size
+shrinkage toward average and a 0.1 floor. Without them, one matchday of CL data
+crashed the fit (sides on 0 goals) or, floored only, priced PSG at 96% against
+Liverpool. Home advantage comes from the competition's own home/away goal
+split, applied once. Both competitions are now fitted the way the league
+scripts are (previous season plus current, time-decayed, fitted rho): for the CL
+this was the largest single gain found (docs/MODEL_CHANGES.md). fit_team_ratings
+above is kept for corner counts only.
 """
 
 import math
 import os
 import time
+import unicodedata
+import urllib.error
 import urllib.request
 import json
+import sys
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
 
 def _load_api_key(var="FOOTBALL_DATA_KEY", required=True):
@@ -52,36 +64,194 @@ def api_get(endpoint, params=None):
     if params:
         url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
     req = urllib.request.Request(url, headers={"X-Auth-Token": API_KEY})
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code != 429:
+            raise
+        # Over the free tier's 10 requests a minute (a run makes 9-10): wait for the
+        # counter to reset and retry once, rather than silently fitting without a season.
+        wait = int(e.headers.get("X-RequestCounter-Reset") or 60) + 1
+        print(f"  [rate limit] waiting {wait}s...")
+        time.sleep(wait)
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
 
 
-def fetch_finished_matches(competition, limit=380):
+DAYS_AHEAD = 7   # fixture window in days; override with --days N
+
+# Fixtures come from the API: every scheduled match in the next DAYS_AHEAD days. To
+# predict specific games instead, list them as (home, away, kickoff, note), e.g.
+# ("Real Madrid", "Bayern München", "Tue 20:00", "QF leg 1"); names go through resolve().
+CL_FIXTURES  = []
+ELC_FIXTURES = []
+
+# The Championship is a league, so it is fitted the way the league scripts are: the
+# previous season plus the current one so far, time-decayed, with a fitted rho. In the
+# club backtest this beat a current-season-only fit (docs/MODEL_CHANGES.md).
+ELC_SEASON       = 2026     # season in progress (starting year); bump each August
+ELC_DECAY        = 0.0035
+# Priors for sides new to the division: their ratings start here and are shrunk back
+# toward them (not toward average) until their own results take over. Measured on
+# football-data.co.uk 2019-20 to 2025-26 as first-season goals scored / conceded per
+# game relative to the division average, 21 sides each way (docs/MODEL_CHANGES.md).
+ELC_RELEGATED_ATT, ELC_RELEGATED_DEF = 1.18, 0.79   # down from the Premier League
+ELC_PROMOTED_ATT,  ELC_PROMOTED_DEF  = 0.88, 1.10   # up from League One
+PRIOR_GAMES = 5   # a newcomer's prior fades as it plays, worth about this many games (ELC and CL)
+
+# The CL is fitted on the previous CL_HISTORY seasons plus the current one so far,
+# time-decayed like the Championship. Several previous seasons rather than one let
+# clubs that qualify regularly but missed a season or two (Porto, Feyenoord, Shakhtar)
+# keep a rating from their own CL results instead of a newcomer prior. A newcomer is a
+# side with no CL match in that window. Newcomers from outside the big five leagues
+# start with a weak prior that fades like the ELC ones: first-season attack 0.63 /
+# defence 1.24 vs the CL average, 16 such sides (new against the season before) over
+# 2024-25 and 2025-26 and stable across both. Newcomers from the big five stay
+# average: a prior for them was not reliably better (docs/MODEL_CHANGES.md). Each team's
+# country comes from the CL team list.
+CL_SEASON = 2026     # season in progress (starting year); bump each August
+CL_HISTORY = 3       # previous CL seasons fitted (the free tier serves 2023-24 onward)
+CL_BIG5 = {"England", "Spain", "Germany", "Italy", "France"}
+CL_LEAGUE_COUNTRY = {"Monaco": "France"}     # AS Monaco plays in Ligue 1
+CL_NEWCOMER_ATT, CL_NEWCOMER_DEF = 0.63, 1.24
+# Fallback home/away averages if no CL data can be fetched: the API's 2023-24 to
+# 2025-26 seasons (503 matches). With several seasons of data they are not otherwise used.
+CL_PRIOR_HOME, CL_PRIOR_AWAY = 1.90, 1.44
+
+
+def days_ahead():
+    """--days N on the command line, else DAYS_AHEAD."""
+    if "--days" in sys.argv[1:-1]:
+        return int(sys.argv[sys.argv.index("--days") + 1])
+    return DAYS_AHEAD
+
+
+def fetch_fixtures(competitions, days):
+    """Scheduled matches from today through `days` days ahead -> {competition:
+    [(home, away, kickoff, note), ...]}, kickoff in local time, note = stage and
+    matchday. All competitions come in one request per 10 days (the cross-competition
+    endpoint's longest date range), which keeps a run within the free tier's 10
+    requests a minute. That endpoint's dateTo is exclusive, so chunks run [lo, hi)."""
+    start = datetime.now(timezone.utc).date()
+    end = start + timedelta(days=days + 1)
+    raw, lo = [], start
+    while lo < end:
+        hi = min(end, lo + timedelta(days=10))
+        try:
+            raw += api_get("/matches", {"competitions": ",".join(competitions),
+                                        "dateFrom": lo.isoformat(),
+                                        "dateTo": hi.isoformat()}).get("matches", [])
+        except Exception as e:
+            print(f"  [fixtures {lo} to {hi}] API error: {e}")
+        lo = hi
+    out = {c: [] for c in competitions}
+    for m in sorted(raw, key=lambda m: (m["utcDate"], m["homeTeam"].get("name") or "")):
+        code = (m.get("competition") or {}).get("code")
+        home = m["homeTeam"].get("shortName") or m["homeTeam"].get("name")
+        away = m["awayTeam"].get("shortName") or m["awayTeam"].get("name")
+        if code not in out or m.get("status") not in ("SCHEDULED", "TIMED") or not home or not away:
+            continue   # knockout ties not yet drawn have no teams
+        ko = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00")).astimezone()
+        stage = (m.get("stage") or "").replace("_", " ").capitalize()
+        note = " ".join(x for x in (stage, f"MD{m['matchday']}" if m.get("matchday") else "") if x)
+        out[code].append((home, away, ko.strftime("%a %d %b %H:%M"), note or None))
+    for c in competitions:
+        print(f"  [{c}] {len(out[c])} scheduled fixtures in the next {days} days.")
+    return out
+
+
+_RAW_MATCHES = {}   # (competition, season) -> the API's match list, reused for corners
+
+
+def fetch_season(competition, season, limit=600):
+    """Finished matches of one season -> [(home, away, hg, ag, utcDate), ...] by date."""
     try:
         data = api_get(f"/competitions/{competition}/matches",
-                       {"status": "FINISHED", "limit": limit})
-        matches = []
-        for m in data.get("matches", []):
-            home = m["homeTeam"]["shortName"]
-            away = m["awayTeam"]["shortName"]
-            hg   = m["score"]["fullTime"]["home"]
-            ag   = m["score"]["fullTime"]["away"]
-            if hg is None or ag is None:
-                continue
-            matches.append((home, away, int(hg), int(ag)))
-        print(f"  [{competition}] Fetched {len(matches)} finished matches.")
-        return matches
+                       {"status": "FINISHED", "season": season, "limit": limit})
     except Exception as e:
-        print(f"  [{competition}] API error: {e}. Using neutral ratings.")
+        print(f"  [{competition} {season}] API error: {e}")
         return []
+    _RAW_MATCHES[(competition, season)] = data.get("matches", [])
+    out = []
+    for m in data.get("matches", []):
+        hg, ag = m["score"]["fullTime"]["home"], m["score"]["fullTime"]["away"]
+        if hg is None or ag is None:
+            continue
+        out.append((m["homeTeam"]["shortName"], m["awayTeam"]["shortName"], int(hg), int(ag),
+                    m.get("utcDate", "")))
+    out.sort(key=lambda x: x[4])
+    print(f"  [{competition} {season}-{season+1}] Fetched {len(out)} finished matches.")
+    return out
 
 
-def fit_team_ratings(matches, home_advantage=1.25, n_iter=200, lr=0.01):
+# Fixture spelling -> the API's shortName, which uses its own short forms ('Barça',
+# 'Atleti', 'Bayern'). An unmatched name would silently get a neutral 1.0 rating.
+ALIASES = {
+    "Bayern München":      ["Bayern"],
+    "Bayern Munich":       ["Bayern"],
+    "Barcelona":           ["Barça"],
+    "Atletico Madrid":     ["Atleti"],
+    "Paris Saint-Germain": ["PSG"],
+    "Inter Milan":         ["Inter"],
+    "Borussia Dortmund":   ["Dortmund"],
+    "Manchester City":     ["Man City"],
+    "Manchester United":   ["Man United"],
+    "Shakhtar Donetsk":    ["Shaktar"],
+    "Slovan Bratislava":   ["Sl. Bratislava"],
+    "AEK Athens":          ["PAE AEK"],
+    "Bodo/Glimt":          ["Bodø/Glimt"],   # 'ø' has no ASCII decomposition, so _flat drops it
+}
+
+
+def _flat(s):
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii").lower()
+    return "".join(ch for ch in s if ch.isalnum())
+
+
+def resolve(name, data_teams):
+    """Fixture name -> the API's name, or None. Exact, accent/punctuation-insensitive
+    or ALIASES matches only; no token guessing (see pl_model.py for why)."""
+    flat = {_flat(t): t for t in data_teams}
+    for cand in [name] + ALIASES.get(name, []):
+        hit = flat.get(_flat(cand))
+        if hit:
+            return hit
+    return None
+
+
+def resolve_fixtures(label, names, matches):
+    """-> {fixture name: data name}. Unmatched names keep their spelling, so they get
+    a neutral 1.0 rating, but are flagged rather than passed through silently."""
+    data_teams = {t for m in matches for t in m[:2]}
+    out = {}
+    for nm in sorted(set(names)):
+        hit = resolve(nm, data_teams)
+        out[nm] = hit or nm
+        if hit and hit != nm:
+            print(f"  [{label}] {nm} -> {hit}")
+        elif not hit and data_teams:
+            print(f"  [{label}] [warn] '{nm}' not in this season's data -> neutral 1.0 rating")
+    return out
+
+
+def auto_shrinkage(n_matches):
+    """Same schedule as the league scripts: pull harder toward average when data is thin."""
+    if   n_matches < 100:  return 0.12
+    elif n_matches < 200:  return 0.08
+    elif n_matches < 300:  return 0.05
+    else:                  return 0.03
+
+
+def fit_team_ratings(matches, home_advantage=1.0, n_iter=200, lr=0.01):
     """Shared by goals and corners: a corner record is just
     (home, away, home_count, away_count), the same shape as a scoreline."""
     teams = set()
+    games = defaultdict(int)
     for h, a, _, _ in matches:
         teams.add(h); teams.add(a)
+        games[h] += 1; games[a] += 1
+    shrinkage = auto_shrinkage(len(matches))
 
     attack  = {t: 1.0 for t in teams}
     defence = {t: 1.0 for t in teams}
@@ -101,8 +271,18 @@ def fit_team_ratings(matches, home_advantage=1.25, n_iter=200, lr=0.01):
             def_num[h] += ag;  def_den[h] += lam_a / defence[h]
 
         for t in teams:
-            if att_den[t] > 0: attack[t]  *= (att_num[t] / att_den[t]) ** lr
-            if def_den[t] > 0: defence[t] *= (def_num[t] / def_den[t]) ** lr
+            shrink_t = shrinkage * (20 / (games[t] + 20))
+            # One pseudo-goal at the expected rate in each ratio: (0/x)**lr is 0 whatever
+            # lr is, so without it a side on 0 goals after one match collapses to the floor
+            # and distorts everyone else's normalised rating. Negligible over a full season.
+            if att_den[t] > 0:
+                attack[t]  = attack[t] * (((att_num[t] + 1) / (att_den[t] + 1)) ** lr)
+                attack[t]  = attack[t] * (1 - shrink_t) + shrink_t
+            if def_den[t] > 0:
+                defence[t] = defence[t] * (((def_num[t] + 1) / (def_den[t] + 1)) ** lr)
+                defence[t] = defence[t] * (1 - shrink_t) + shrink_t
+            # Floor: a side on 0 goals scored (or conceded) must never reach 0 and crash log().
+            attack[t] = max(attack[t], 0.1); defence[t] = max(defence[t], 0.1)
 
         att_mean = math.exp(sum(math.log(v) for v in attack.values())  / len(teams))
         def_mean = math.exp(sum(math.log(v) for v in defence.values()) / len(teams))
@@ -110,6 +290,76 @@ def fit_team_ratings(matches, home_advantage=1.25, n_iter=200, lr=0.01):
         defence = {t: v / def_mean for t, v in defence.items()}
 
     return attack, defence, avg_home, avg_away
+
+
+def fit_league_ratings(matches, priors=None, n_iter=300, lr=0.01, decay=ELC_DECAY):
+    """The league scripts' fit (pl_model.py), for the Championship: matches are
+    (home, away, hg, ag, date) over two seasons, time-decayed by match order, shrunk
+    by sample size, with one pseudo-goal per ratio. Home advantage comes from the
+    weighted home/away averages, applied once. `priors` maps a team to (attack,
+    defence): it starts there and is shrunk toward a target that slides from the
+    prior to 1.0 as the team plays (worth PRIOR_GAMES games). A prior that never
+    fades kept dragging newcomers back all season and cost accuracy later on."""
+    teams = set()
+    for h, a, _, _, _ in matches:
+        teams.add(h); teams.add(a)
+    shrinkage = auto_shrinkage(len(matches))
+    priors = priors or {}
+    ms = sorted(matches, key=lambda x: x[4])
+    n = len(ms)
+    weights = [math.exp(-decay * (n - 1 - i)) for i in range(n)]
+    avg_home = sum(w * hg for (_, _, hg, _, _), w in zip(ms, weights)) / sum(weights)
+    avg_away = sum(w * ag for (_, _, _, ag, _), w in zip(ms, weights)) / sum(weights)
+    team_matches = defaultdict(float)
+    for (h, a, _, _, _), w in zip(ms, weights):
+        team_matches[h] += w; team_matches[a] += w
+    fade = {t: PRIOR_GAMES / (PRIOR_GAMES + team_matches[t]) for t in teams}
+    a_prior = {t: 1 + (priors.get(t, (1.0, 1.0))[0] - 1) * fade[t] for t in teams}
+    d_prior = {t: 1 + (priors.get(t, (1.0, 1.0))[1] - 1) * fade[t] for t in teams}
+    # Ratings are still normalised to a geometric mean of 1. Rescaling to the priors'
+    # mean (main.py's 4c fix) needs reciprocal attack/defence priors; these are not
+    # (0.79 x 1.10 != 1), and doing it cut every match's expected goals by ~1%.
+    attack  = dict(a_prior)
+    defence = dict(d_prior)
+    for _ in range(n_iter):
+        att_num = defaultdict(float); att_den = defaultdict(float)
+        def_num = defaultdict(float); def_den = defaultdict(float)
+        for (h, a, hg, ag, _), w in zip(ms, weights):
+            lam_h = avg_home * attack[h] * defence[a]
+            lam_a = avg_away * attack[a] * defence[h]
+            att_num[h] += w * hg;  att_den[h] += w * lam_h / attack[h]
+            att_num[a] += w * ag;  att_den[a] += w * lam_a / attack[a]
+            def_num[a] += w * hg;  def_den[a] += w * lam_h / defence[a]
+            def_num[h] += w * ag;  def_den[h] += w * lam_a / defence[h]
+        for t in teams:
+            shrink_t = shrinkage * (20 / (team_matches[t] + 20))
+            if att_den[t] > 0:
+                attack[t]  = attack[t] * (((att_num[t] + 1) / (att_den[t] + 1)) ** lr)
+                attack[t]  = attack[t] * (1 - shrink_t) + shrink_t * a_prior[t]
+            if def_den[t] > 0:
+                defence[t] = defence[t] * (((def_num[t] + 1) / (def_den[t] + 1)) ** lr)
+                defence[t] = defence[t] * (1 - shrink_t) + shrink_t * d_prior[t]
+        att_mean = math.exp(sum(math.log(v) for v in attack.values())  / len(teams))
+        def_mean = math.exp(sum(math.log(v) for v in defence.values()) / len(teams))
+        attack  = {t: v / att_mean for t, v in attack.items()}
+        defence = {t: v / def_mean for t, v in defence.items()}
+    return attack, defence, avg_home, avg_away
+
+
+def fit_rho_league(matches, attack, defence, avg_home, avg_away):
+    """Dixon-Coles rho by likelihood over the league scripts' grid."""
+    best_rho, best_ll = -0.13, float("-inf")
+    for rho_test in [-0.25, -0.20, -0.18, -0.15, -0.13, -0.10, -0.08, -0.05, 0.0, 0.05]:
+        ll = 0.0
+        for h, a, hg, ag, _ in matches:
+            lh = avg_home * attack.get(h, 1.0) * defence.get(a, 1.0)
+            la = avg_away * attack.get(a, 1.0) * defence.get(h, 1.0)
+            p = poisson_pmf(hg, lh) * poisson_pmf(ag, la) * dixon_coles_tau(hg, ag, lh, la, rho_test)
+            if p > 0:
+                ll += math.log(p)
+        if ll > best_ll:
+            best_ll, best_rho = ll, rho_test
+    return best_rho
 
 
 def poisson_pmf(k, lam):
@@ -217,19 +467,24 @@ HOME_CORNER_ADV   = 1.10   # home sides win slightly more corners
 # Optional manual override: {"CL": [("Real Madrid","Bayern München",6,5), ...]}
 CORNER_DATA = {}
 
-def fetch_corner_matches(competition, limit=380):
+def fetch_corner_matches(competition, season=None, limit=380):
     """-> [(home, away, home_corners, away_corners), ...], empty on the free
     tier. The statistics field path varies by plan and could not be tested
     without the paid add-on, so if this comes back empty on a paid plan, print
-    a single match detail with api_get(f'/matches/{id}') and fix the keys."""
-    try:
-        data = api_get(f"/competitions/{competition}/matches",
-                       {"status": "FINISHED", "limit": limit})
-    except Exception as e:
-        print(f"  [{competition}] corner fetch error: {e}")
-        return []
+    a single match detail with api_get(f'/matches/{id}') and fix the keys.
+    Reuses the season's match list if fetch_season already has it."""
+    matches = _RAW_MATCHES.get((competition, season))
+    if matches is None:
+        params = {"status": "FINISHED", "limit": limit}
+        if season is not None:
+            params["season"] = season
+        try:
+            matches = api_get(f"/competitions/{competition}/matches", params).get("matches", [])
+        except Exception as e:
+            print(f"  [{competition}] corner fetch error: {e}")
+            return []
     out = []
-    for m in data.get("matches", []):
+    for m in matches:
         hn = m["homeTeam"]["shortName"]; an = m["awayTeam"]["shortName"]
         stats = m.get("statistics")
         if not isinstance(stats, dict):
@@ -247,17 +502,19 @@ def fetch_corner_matches(competition, limit=380):
     return out
 
 
-def corner_ratings(competition, att, dff):
-    """Return (catt, cconc, avg_hc, avg_ac, source). Fits on real corner data
-    if available (paid add-on / CORNER_DATA), else proxies from goal ratings."""
-    cmatches = CORNER_DATA.get(competition) or fetch_corner_matches(competition)
+def corner_ratings(competition, att, dff, season=None):
+    """Return (catt, cconc, avg_hc, avg_ac, source, home_mult). Fits on real corner
+    data if available (paid add-on / CORNER_DATA), else proxies from goal ratings.
+    Fitted averages already carry the home edge (home_mult 1.0); the proxy's neutral
+    CORNER_BASE gets HOME_CORNER_ADV once."""
+    cmatches = CORNER_DATA.get(competition) or fetch_corner_matches(competition, season)
     if cmatches and len(cmatches) >= 10:
-        catt, cconc, avg_hc, avg_ac = fit_team_ratings(
-            cmatches, home_advantage=HOME_CORNER_ADV)
-        return catt, cconc, avg_hc, avg_ac, f"fitted on {len(cmatches)} corner matches"
+        catt, cconc, avg_hc, avg_ac = fit_team_ratings(cmatches)
+        return catt, cconc, avg_hc, avg_ac, f"fitted on {len(cmatches)} corner matches", 1.0
     catt  = {t: att.get(t, 1.0) ** CORNER_PROXY_BETA for t in att}
     cconc = {t: dff.get(t, 1.0) ** CORNER_PROXY_BETA for t in dff}
-    return catt, cconc, CORNER_BASE, CORNER_BASE, "GOAL-RATING PROXY (no corner data)"
+    return (catt, cconc, CORNER_BASE, CORNER_BASE, "GOAL-RATING PROXY (no corner data)",
+            HOME_CORNER_ADV)
 
 
 def summarize_corners(matrix):
@@ -310,87 +567,137 @@ def print_corner_prediction(home, away, lh, la, league=None, kickoff=None, note=
 
 
 def main():
-    print("Champions League Quarter-Finals + Championship")
+    days = days_ahead()
+    print(f"Champions League + Championship  |  fixtures in the next {days} days")
     print("Dixon-Coles Poisson Model  (goals + corners)")
     print("=" * 72)
 
     RHO = -0.13
 
-    print("\nFetching Champions League data...")
-    cl_matches = fetch_finished_matches("CL")
+    print(f"\nFetching Champions League data (previous {CL_HISTORY} seasons + current so far)...")
+    cl_prev = [m for back in range(CL_HISTORY, 0, -1) for m in fetch_season("CL", CL_SEASON - back)]
+    cl_matches = cl_prev + fetch_season("CL", CL_SEASON)
+    cl_prev_teams = {t for m in cl_prev for t in m[:2]}
+    try:   # each club's country, to tell big-five newcomers from the rest
+        cl_country = {t["shortName"]: (t.get("area") or {}).get("name") for t in
+                      api_get("/competitions/CL/teams", {"season": CL_SEASON}).get("teams", [])}
+    except Exception as e:
+        print(f"  [warn] CL team list unavailable ({e}) -> all CL newcomers rated average.")
+        cl_country = {}
     time.sleep(0.5)
-    print("Fetching Championship data...")
-    elc_matches = fetch_finished_matches("ELC")
+
+    def cl_prior(team):
+        """(attack, defence) prior: weak for a newcomer from outside the big five, else 1.0."""
+        country = CL_LEAGUE_COUNTRY.get(cl_country.get(team), cl_country.get(team))
+        if team in cl_prev_teams or country is None or country in CL_BIG5:
+            return 1.0, 1.0
+        return CL_NEWCOMER_ATT, CL_NEWCOMER_DEF
+    print("Fetching Championship data (previous season + current so far)...")
+    elc_prev = fetch_season("ELC", ELC_SEASON - 1)
+    elc_matches = elc_prev + fetch_season("ELC", ELC_SEASON)
+    # Last season's Premier League sides identify who came down this season.
+    pl_prev_teams = {t for m in fetch_season("PL", ELC_SEASON - 1) for t in m[:2]}
+    elc_prev_teams = {t for m in elc_prev for t in m[:2]}
+    if not pl_prev_teams:
+        print("  [warn] no Premier League data -> relegated sides get the promoted prior.")
     time.sleep(0.5)
+
+    def elc_prior(team):
+        """(attack, defence) prior: relegated, promoted, or 1.0 for last season's sides."""
+        if team in pl_prev_teams:
+            return ELC_RELEGATED_ATT, ELC_RELEGATED_DEF
+        if team not in elc_prev_teams:
+            return ELC_PROMOTED_ATT, ELC_PROMOTED_DEF
+        return 1.0, 1.0
 
     if len(cl_matches) >= 10:
-        print("\nFitting CL team ratings...")
-        cl_att, cl_def, cl_avg_h, cl_avg_a = fit_team_ratings(cl_matches)
+        print(f"\nFitting CL team ratings (league method, {CL_HISTORY + 1} seasons)...")
+        cl_teams = {t for m in cl_matches for t in m[:2]} | set(cl_country)
+        cl_priors = {t: cl_prior(t) for t in cl_teams if cl_prior(t) != (1.0, 1.0)}
+        cl_att, cl_def, cl_avg_h, cl_avg_a = fit_league_ratings(cl_matches, priors=cl_priors)
+        cl_rho = fit_rho_league(cl_matches, cl_att, cl_def, cl_avg_h, cl_avg_a)
+        print(f"  CL rho: {cl_rho}; goal averages home {cl_avg_h:.2f} / away {cl_avg_a:.2f}")
+        print(f"  CL newcomers outside the big five (prior {CL_NEWCOMER_ATT}/{CL_NEWCOMER_DEF}): "
+              f"{sorted(cl_priors)}")
     else:
-        print("  Not enough CL data -- using neutral ratings.")
-        cl_att = {}; cl_def = {}; cl_avg_h = 1.50; cl_avg_a = 1.20
+        print("  Not enough CL data -- using neutral ratings and long-run CL averages.")
+        cl_att = {}; cl_def = {}; cl_avg_h = CL_PRIOR_HOME; cl_avg_a = CL_PRIOR_AWAY; cl_rho = RHO
 
     if len(elc_matches) >= 10:
-        print("Fitting Championship team ratings...")
-        elc_att, elc_def, elc_avg_h, elc_avg_a = fit_team_ratings(elc_matches, home_advantage=1.35)
+        print("Fitting Championship team ratings (league method, two seasons)...")
+        elc_teams = {t for m in elc_matches for t in m[:2]}
+        elc_att, elc_def, elc_avg_h, elc_avg_a = fit_league_ratings(
+            elc_matches, priors={t: elc_prior(t) for t in elc_teams})
+        elc_rho = fit_rho_league(elc_matches, elc_att, elc_def, elc_avg_h, elc_avg_a)
+        print(f"  Championship rho: {elc_rho}")
+        print(f"  Relegated (prior {ELC_RELEGATED_ATT}/{ELC_RELEGATED_DEF}): "
+              f"{sorted(t for t in elc_teams if t in pl_prev_teams)}")
+        print(f"  Promoted  (prior {ELC_PROMOTED_ATT}/{ELC_PROMOTED_DEF}): "
+              f"{sorted(t for t in elc_teams if elc_prior(t) == (ELC_PROMOTED_ATT, ELC_PROMOTED_DEF))}")
     else:
         print("  Not enough ELC data -- using neutral ratings.")
-        elc_att = {}; elc_def = {}; elc_avg_h = 1.50; elc_avg_a = 1.15
+        elc_att = {}; elc_def = {}; elc_avg_h = 1.50; elc_avg_a = 1.15; elc_rho = RHO
 
-    CL_HOME_ADV  = 1.20
-    ELC_HOME_ADV = 1.35
-
+    # Home advantage is applied once: the fitted (or fallback) home/away averages
+    # already carry it, so no CL/ELC multiplier goes on top (docs/MODEL_CHANGES.md).
     def lam_cl(home, away):
-        h_att = cl_att.get(home,1.0); h_def = cl_def.get(home,1.0)
-        a_att = cl_att.get(away,1.0); a_def = cl_def.get(away,1.0)
-        return round(cl_avg_h*h_att*a_def*CL_HOME_ADV,3), round(cl_avg_a*a_att*h_def,3)
+        # A side with no CL match in the fitted seasons yet uses its newcomer prior.
+        h_att = cl_att.get(home, cl_prior(home)[0]); h_def = cl_def.get(home, cl_prior(home)[1])
+        a_att = cl_att.get(away, cl_prior(away)[0]); a_def = cl_def.get(away, cl_prior(away)[1])
+        return round(cl_avg_h*h_att*a_def,3), round(cl_avg_a*a_att*h_def,3)
 
     def lam_elc(home, away):
-        h_att = elc_att.get(home,1.0); h_def = elc_def.get(home,1.0)
-        a_att = elc_att.get(away,1.0); a_def = elc_def.get(away,1.0)
-        return round(elc_avg_h*h_att*a_def*ELC_HOME_ADV,3), round(elc_avg_a*a_att*h_def,3)
+        # A side with no match in either season yet uses its relegated/promoted prior.
+        h_att = elc_att.get(home, elc_prior(home)[0]); h_def = elc_def.get(home, elc_prior(home)[1])
+        a_att = elc_att.get(away, elc_prior(away)[0]); a_def = elc_def.get(away, elc_prior(away)[1])
+        return round(elc_avg_h*h_att*a_def,3), round(elc_avg_a*a_att*h_def,3)
 
     # Corner ratings are fitted per competition, not shared.
-    cl_catt, cl_ccon, cl_chc, cl_cac, cl_csrc = corner_ratings("CL", cl_att, cl_def)
-    elc_catt, elc_ccon, elc_chc, elc_cac, elc_csrc = corner_ratings("ELC", elc_att, elc_def)
+    cl_catt, cl_ccon, cl_chc, cl_cac, cl_csrc, cl_cha = corner_ratings("CL", cl_att, cl_def, CL_SEASON)
+    elc_catt, elc_ccon, elc_chc, elc_cac, elc_csrc, elc_cha = corner_ratings("ELC", elc_att, elc_def, ELC_SEASON)
 
     def clam_cl(home, away):
-        return (round(cl_chc*cl_catt.get(home,1.0)*cl_ccon.get(away,1.0)*HOME_CORNER_ADV,3),
+        return (round(cl_chc*cl_catt.get(home,1.0)*cl_ccon.get(away,1.0)*cl_cha,3),
                 round(cl_cac*cl_catt.get(away,1.0)*cl_ccon.get(home,1.0),3))
 
     def clam_elc(home, away):
-        return (round(elc_chc*elc_catt.get(home,1.0)*elc_ccon.get(away,1.0)*HOME_CORNER_ADV,3),
+        return (round(elc_chc*elc_catt.get(home,1.0)*elc_ccon.get(away,1.0)*elc_cha,3),
                 round(elc_cac*elc_catt.get(away,1.0)*elc_ccon.get(home,1.0),3))
 
-    cl_fixtures = [
-        ("Real Madrid",  "Bayern München", "8:00 PM", "CL QF Leg 1 -- Tuesday"),
-        ("Sporting CP",  "Arsenal",        "8:00 PM", "CL QF Leg 1 -- Tuesday"),
-        ("Barcelona",    "Atletico Madrid","8:00 PM", "CL QF Leg 1 -- Wednesday"),
-        ("PSG",          "Liverpool",      "8:00 PM", "CL QF Leg 1 -- Wednesday"),
-    ]
-    elc_fixtures = [
-        ("Wrexham", "Southampton", "8:00 PM", None),
-    ]
+    print("\nFixtures:")
+    wanted = [c for c, listed in (("CL", CL_FIXTURES), ("ELC", ELC_FIXTURES)) if not listed]
+    fetched = fetch_fixtures(wanted, days) if wanted else {}
+    cl_fixtures = CL_FIXTURES or fetched.get("CL", [])
+    elc_fixtures = ELC_FIXTURES or fetched.get("ELC", [])
+    if not cl_fixtures and not elc_fixtures:
+        print(f"  Nothing scheduled in the next {days} days (international break?). Try --days 14.")
+        return
 
-    print(f"\n{'='*72}\nCHAMPIONS LEAGUE QF -- GOALS\n{'='*72}\n")
-    for home, away, ko, note in cl_fixtures:
-        lh, la = lam_cl(home, away)
-        print_prediction(home, away, lh, la, league="Champions League QF", kickoff=ko, note=note, rho=RHO)
+    print("\nName resolution (fixture name -> API name):")
+    cl_names = resolve_fixtures("CL", [t for f in cl_fixtures for t in f[:2]], cl_matches)
+    elc_names = resolve_fixtures("ELC", [t for f in elc_fixtures for t in f[:2]], elc_matches)
 
-    print(f"\n{'='*72}\nCHAMPIONS LEAGUE QF -- CORNERS  ({cl_csrc})\n{'='*72}\n")
-    for home, away, ko, note in cl_fixtures:
-        lhc, lac = clam_cl(home, away)
-        print_corner_prediction(home, away, lhc, lac, league="Champions League QF", kickoff=ko, note=note)
+    if cl_fixtures:
+        print(f"\n{'='*72}\nCHAMPIONS LEAGUE -- GOALS\n{'='*72}\n")
+        for home, away, ko, note in cl_fixtures:
+            lh, la = lam_cl(cl_names[home], cl_names[away])
+            print_prediction(home, away, lh, la, league="Champions League", kickoff=ko, note=note, rho=cl_rho)
 
-    print(f"\n{'='*72}\nCHAMPIONSHIP -- GOALS\n{'='*72}\n")
-    for home, away, ko, note in elc_fixtures:
-        lh, la = lam_elc(home, away)
-        print_prediction(home, away, lh, la, league="Championship", kickoff=ko, note=note, rho=RHO)
+        print(f"\n{'='*72}\nCHAMPIONS LEAGUE -- CORNERS  ({cl_csrc})\n{'='*72}\n")
+        for home, away, ko, note in cl_fixtures:
+            lhc, lac = clam_cl(cl_names[home], cl_names[away])
+            print_corner_prediction(home, away, lhc, lac, league="Champions League", kickoff=ko, note=note)
 
-    print(f"\n{'='*72}\nCHAMPIONSHIP -- CORNERS  ({elc_csrc})\n{'='*72}\n")
-    for home, away, ko, note in elc_fixtures:
-        lhc, lac = clam_elc(home, away)
-        print_corner_prediction(home, away, lhc, lac, league="Championship", kickoff=ko, note=note)
+    if elc_fixtures:
+        print(f"\n{'='*72}\nCHAMPIONSHIP -- GOALS\n{'='*72}\n")
+        for home, away, ko, note in elc_fixtures:
+            lh, la = lam_elc(elc_names[home], elc_names[away])
+            print_prediction(home, away, lh, la, league="Championship", kickoff=ko, note=note, rho=elc_rho)
+
+        print(f"\n{'='*72}\nCHAMPIONSHIP -- CORNERS  ({elc_csrc})\n{'='*72}\n")
+        for home, away, ko, note in elc_fixtures:
+            lhc, lac = clam_elc(elc_names[home], elc_names[away])
+            print_corner_prediction(home, away, lhc, lac, league="Championship", kickoff=ko, note=note)
 
 
 if __name__ == "__main__":

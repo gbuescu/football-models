@@ -74,11 +74,13 @@ which variable is missing, rather than failing somewhere further in.
 First check all four scripts compile:
 
 ```bash
-python -m py_compile pl_model.py liga_portugal_model.py cl_corners_model.py regular_prediction_model.py
+python -m py_compile pl_model.py liga_portugal_model.py cl_corners_model.py regular_prediction_model.py club_backtest.py
 ```
 
 Silence means they compiled. Then run the Premier League script, which
-exercises the most machinery:
+exercises the most machinery. It predicts every Premier League match scheduled
+in the next 7 days (add `--days 14` if that window falls in an international
+break):
 
 ```bash
 python pl_model.py
@@ -102,13 +104,16 @@ compute and print, and will be worthless. Fix the fetch before reading on.
 The Liga Portugal script is the same idea: 306 matches, and Porto top on 88
 points.
 
-After the table come the fitted attack and defence ratings per club, then the
-predictions themselves. A few things in that output are expected rather than
-faults:
+After the table it fetches the current season's finished matches and lists
+the promoted clubs it found (teams in this season's data but not last
+season's). Then come the fitted attack and defence ratings per club, fitted on
+both seasons, then the predictions themselves. A few things in that output are
+expected rather than faults:
 
-Predictions for newly promoted clubs are marked `PRIOR-BASED`. Those sides have
-no top-flight record to fit against, so the model is using an assumed
-weak-side rating. Treat them as assumption rather than measurement.
+Promoted clubs are rated from their current-season matches, starting from a
+measured weak-side prior that fades as they play. Before a promoted club's
+first top-flight match, its predictions are marked `PRIOR-BASED`: the model is
+using the prior alone. Treat them as assumption rather than measurement.
 
 Corner output is marked as a goal-rating proxy unless you have the paid
 statistics add-on. That label is accurate and should stay.
@@ -121,7 +126,25 @@ club will silently fall back to the promoted-side prior.
 
 If the API is unreachable the scripts say so and carry on with neutral ratings
 rather than crashing. That output is not meaningful, so do not read predictions
-from a run that reported an API error.
+from a run that reported an API error. The usual cause is the rate limit of 10
+requests a minute. `cl_corners_model.py` waits for the limit to reset and
+retries, but the other scripts don't, so leave a minute between runs.
+
+## Backtest
+
+`club_backtest.py` replays 2019-20 to 2025-26 against Pinnacle's odds. The first
+time, download the 24 football-data.co.uk CSVs (about 4 MB, into `data/clubs/`,
+gitignored as CSVs):
+
+```bash
+python club_backtest.py --fetch
+```
+
+After that, run it without `--fetch`. It makes no API calls, but it imports the
+model scripts, so `FOOTBALL_DATA_KEY` still has to be set. It takes about two
+minutes and rewrites `docs/CLUB_BACKTEST_RESULTS.md`. The downloads are checked
+against stored checksums, and a file football-data.co.uk has since corrected is
+flagged with a warning.
 
 ## First commit
 
@@ -176,6 +199,6 @@ Confirm nothing unwanted made it in:
 git ls-files
 ```
 
-Read the list. It should be the four scripts, the markdown files,
-`.env.example` and `.gitignore`. If a `.env` or a CSV export is in there, the
+Read the list. It should be the four scripts, `club_backtest.py`, the
+markdown files (including `docs/`), `.env.example` and `.gitignore`. If a `.env` or a CSV export is in there, the
 key needs rotating again and the history needs rewriting.

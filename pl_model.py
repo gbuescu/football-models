@@ -4,14 +4,16 @@
 Runs in two stages. Stage one pulls every finished match of the completed
 season and reports the league-wide splits, the final table rebuilt from the
 match record, per-team home and away breakdowns, and the common scorelines,
-then writes the lot to CSV. Stage two fits Dixon-Coles ratings on those same
-matches and applies them to the opening fixtures.
+then writes the lot to CSV. Stage two fits Dixon-Coles ratings on those matches
+plus the current season's finished ones (time-decay makes this season count most)
+and predicts the API's scheduled fixtures for the next DAYS_AHEAD days (--days N),
+unless FIXTURES lists specific games.
 
 What this adds over the standard model: time-decay weighting so late-season
 form counts for more, sample-size shrinkage, a half-time model built from the
 free tier's half-time scores, a negative binomial on corner totals, promoted
 side priors, and the guarded name resolution described below. Home advantage
-is 1.20 here, tuned for this league.
+is the season's own home/away goal split, applied once (docs/MODEL_CHANGES.md).
 
 The rebuilt table is the fetch sanity check. Arsenal should come out champions
 for 2025-26, with West Ham, Burnley and Wolves in the bottom three. If the
@@ -29,18 +31,21 @@ Name resolution. Token matching is genuinely dangerous in this league.
 and Hull City share 'city' with Manchester City. Matched naively, Coventry
 City resolved to Man City, which would have rated a promoted club as the best
 side in the division and still printed RELIABLE. Three guards prevent that:
-promoted clubs short-circuit to the prior before any matching runs, an explicit
-ALIASES table does the real work, and a match on a weak token alone is
-rejected rather than guessed. All three are load-bearing.
+promoted clubs never reach token matching (they resolve by alias or exact name
+to their current-season data, or else go to the prior), an explicit ALIASES
+table does the real work, and a match on a weak token alone is rejected rather
+than guessed. All three are load-bearing.
 """
 
 import csv
 import json
 import math
 import os
+import sys
 import unicodedata
 import urllib.request
 from collections import defaultdict, Counter
+from datetime import datetime, timedelta, timezone
 
 
 def _load_api_key(var="FOOTBALL_DATA_KEY", required=True):
@@ -73,20 +78,27 @@ API_KEY  = _load_api_key()
 BASE_URL    = "https://api.football-data.org/v4"
 COMPETITION = "PL"           # Premier League (free tier)
 
-SEASON      = 2025           # starting year, so 2025 means the 2025-26 season
+SEASON      = 2025           # last completed season (starting year, so 2025-26)
+CURRENT     = SEASON + 1     # season in progress: its finished matches are fitted too
+DAYS_AHEAD  = 7              # fixture window in days; override with --days N
 FETCH_LIMIT = 400            # a 20-team season is exactly 380, with margin added
 MIN_MATCHES = 40             # below this the ratings are meaningless
 
-HOME_ADV    = 1.20           # Premier League home advantage
+# Home advantage is not a constant here: the season's own (decay-weighted) home and
+# away goal averages already carry it, so it is applied exactly once. A hand-set
+# HOME_ADV used to multiply on top and double-count it (docs/MODEL_CHANGES.md).
 DECAY       = 0.0035         # time-decay, so late-season form outweighs August
 RHO_DEFAULT = -0.13          # Dixon-Coles low-score correction
 
 # Promoted sides have no top-flight record to fit against. Attack below 1 means
-# scores less than league average, defence above 1 means concedes more. These
-# are a judgment call rather than a fitted value, so tune them if you disagree,
-# but do not leave them at 1.0: that rates a promoted side as mid-table.
-PROMOTED_ATT = 0.80
-PROMOTED_DEF = 1.20
+# scores less than league average, defence above 1 means concedes more. Measured on
+# football-data.co.uk 2019-20 to 2025-26 as first-season goals scored / conceded per
+# game vs the league average (21 sides promoted to the PL; was a judgment-call 0.80/1.20).
+# A promoted side starts here and is shrunk toward a target that fades from this
+# prior to league average as it plays (docs/MODEL_CHANGES.md).
+PROMOTED_ATT = 0.69
+PROMOTED_DEF = 1.25
+PRIOR_GAMES  = 5      # the prior is worth about this many games of the side's own results
 PROMOTED     = {"Coventry City", "Ipswich Town", "Hull City"}   # up for 2026-27
 
 EXPORT_CSV   = "premier_league_2025_26_matches.csv"
@@ -98,20 +110,10 @@ CORNER_DISPERSION = 1.25   # variance/mean for corner totals, re-estimated
                            # from data when real corner counts are available
 CORNER_DATA       = []     # optional override: ("Arsenal","Chelsea",7,4,"2026-05-01")
 
-# Matchday 1, 2026-27. A full round is 10 games; Chelsea and Fulham are the two
-# clubs unaccounted for here. Uncomment and set the home side once known.
-FIXTURES = [
-    ("Arsenal",                "Coventry City",      "Fri 21 Aug 20:00"),
-    ("Hull City",              "Manchester United",  "Sat 22 Aug 12:30"),
-    ("Everton",                "Crystal Palace",     "Sat 22 Aug 15:00"),
-    ("Ipswich Town",           "Sunderland",         "Sat 22 Aug 15:00"),
-    ("Nottingham Forest",      "Leeds United",       "Sat 22 Aug 15:00"),
-    ("Brentford",              "Tottenham Hotspur",  "Sat 22 Aug 17:30"),
-    ("Brighton & Hove Albion", "Aston Villa",        "Sun 23 Aug 14:00"),
-    ("Manchester City",        "AFC Bournemouth",    "Sun 23 Aug 14:00"),
-    ("Newcastle United",       "Liverpool",          "Sun 23 Aug 16:30"),
-    # ("Chelsea",              "Fulham",             "TBC"),
-]
+# Fixtures come from the API: every scheduled match in the next DAYS_AHEAD days
+# (override with --days N). To predict specific games instead, list them here,
+# e.g. ("Arsenal", "Chelsea", "Sat 17 Oct 15:00"); names go through resolve().
+FIXTURES = []
 
 # Display name -> the spellings football-data.org might use, best guess first.
 ALIASES = {
@@ -173,6 +175,37 @@ def fetch_season(competition, season, limit=FETCH_LIMIT):
         })
     out.sort(key=lambda x: x["date"])
     print(f"  [{competition} {season}-{season+1}] {len(out)} finished matches fetched.")
+    return out
+
+
+def days_ahead():
+    """--days N on the command line, else DAYS_AHEAD."""
+    if "--days" in sys.argv[1:-1]:
+        return int(sys.argv[sys.argv.index("--days") + 1])
+    return DAYS_AHEAD
+
+
+def fetch_fixtures(competition, days):
+    """Scheduled matches from today through `days` days ahead -> [(home, away,
+    kickoff), ...], kickoff in local time. Names are the API's own, so they resolve
+    exactly against the fitted data."""
+    start = datetime.now(timezone.utc).date()
+    try:
+        data = api_get(f"/competitions/{competition}/matches",
+                       {"dateFrom": start.isoformat(),
+                        "dateTo": (start + timedelta(days=days)).isoformat()})
+    except Exception as e:
+        print(f"  [{competition} fixtures] API error: {e}")
+        return []
+    out = []
+    for m in data.get("matches", []):
+        home = m["homeTeam"].get("shortName") or m["homeTeam"].get("name")
+        away = m["awayTeam"].get("shortName") or m["awayTeam"].get("name")
+        if m.get("status") not in ("SCHEDULED", "TIMED") or not home or not away:
+            continue
+        ko = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00")).astimezone()
+        out.append((home, away, ko.strftime("%a %d %b %H:%M")))
+    print(f"  [{competition}] {len(out)} scheduled fixtures in the next {days} days.")
     return out
 
 
@@ -251,7 +284,7 @@ def print_season_report(recs, T):
     print("=" * 78)
     print(f"  Result split : Home {pc(hw)}   Draw {pc(dr)}   Away {pc(aw)}")
     print(f"  Goals        : {(gh+ga)/n:.2f}/game   home {gh/n:.2f}  away {ga/n:.2f}"
-          f"   (raw home/away ratio {gh/max(ga,1):.2f}, model HA={HOME_ADV})")
+          f"   (home/away ratio {gh/max(ga,1):.2f}, applied once as home advantage)")
     print(f"  Over/Under   : O1.5 {pc(o15)}   O2.5 {pc(o25)}   O3.5 {pc(o35)}")
     print(f"  BTTS         : Yes {pc(bt)}   No {pc(n-bt)}")
     if hv:
@@ -311,10 +344,9 @@ def _tokens(name):
 
 
 def resolve(name, data_teams):
-    """-> (api_name | None, how). Promoted clubs short-circuit; aliases do the
-    real work; weak-token-only matches are rejected, never guessed."""
-    if name in PROMOTED:
-        return None, "promoted"
+    """-> (api_name | None, how). Aliases and exact names do the real work;
+    promoted clubs never reach token matching; weak-token-only matches are
+    rejected, never guessed."""
     flat = {}
     for t in data_teams:
         flat.setdefault(_flat(t), t)
@@ -322,6 +354,8 @@ def resolve(name, data_teams):
         hit = flat.get(_flat(cand))
         if hit:
             return hit, "alias"
+    if name in PROMOTED:
+        return None, "promoted"
     qt = _tokens(name)
     scored = []
     for t in data_teams:
@@ -346,18 +380,19 @@ def auto_shrinkage(n_matches):
     else:                  return 0.03
 
 
-def fit_team_ratings(matches, home_advantage=HOME_ADV, n_iter=300, lr=0.01,
-                     decay=DECAY, shrinkage=None, label=""):
+def fit_team_ratings(matches, home_advantage=1.0, n_iter=300, lr=0.01,
+                     decay=DECAY, shrinkage=None, label="", priors=None):
     """matches: [(home, away, home_count, away_count, date), ...]
-    Counts are goals, half-time goals or corners -- same machinery either way."""
+    Counts are goals, half-time goals or corners -- same machinery either way.
+    priors: {team: (attack, defence)} for promoted sides. Such a side starts at its
+    prior and is shrunk toward a target fading from it to 1.0 over PRIOR_GAMES games;
+    everyone else is shrunk toward 1.0 as before."""
     if shrinkage is None:
         shrinkage = auto_shrinkage(len(matches))
         print(f"  {label}shrinkage {shrinkage} on {len(matches)} matches")
     teams = set()
     for h, a, _, _, _ in matches:
         teams.add(h); teams.add(a)
-    attack  = {t: 1.0 for t in teams}
-    defence = {t: 1.0 for t in teams}
     ms = sorted(matches, key=lambda x: x[4])
     n = len(ms)
     weights = [math.exp(-decay * (n - 1 - i)) for i in range(n)]
@@ -366,6 +401,11 @@ def fit_team_ratings(matches, home_advantage=HOME_ADV, n_iter=300, lr=0.01,
     team_matches = defaultdict(float)
     for (h, a, _, _, _), w in zip(ms, weights):
         team_matches[h] += w; team_matches[a] += w
+    priors = priors or {}
+    fade = {t: PRIOR_GAMES / (PRIOR_GAMES + team_matches[t]) for t in teams}
+    a_tgt = {t: 1 + (priors.get(t, (1.0, 1.0))[0] - 1) * fade[t] for t in teams}
+    d_tgt = {t: 1 + (priors.get(t, (1.0, 1.0))[1] - 1) * fade[t] for t in teams}
+    attack, defence = dict(a_tgt), dict(d_tgt)
     for _ in range(n_iter):
         att_num = defaultdict(float); att_den = defaultdict(float)
         def_num = defaultdict(float); def_den = defaultdict(float)
@@ -378,12 +418,14 @@ def fit_team_ratings(matches, home_advantage=HOME_ADV, n_iter=300, lr=0.01,
             def_num[h] += w * ag;  def_den[h] += w * lam_a / defence[h]
         for t in teams:
             shrink_t = shrinkage * (20 / (team_matches[t] + 20))
+            # One pseudo-goal at the expected rate: (0/x)**lr is 0 for any lr, so a side on
+            # 0 goals (e.g. promoted, one game in) would collapse (docs/MODEL_CHANGES.md).
             if att_den[t] > 0:
-                attack[t]  = attack[t] * ((att_num[t] / att_den[t]) ** lr)
-                attack[t]  = attack[t] * (1 - shrink_t) + shrink_t
+                attack[t]  = attack[t] * (((att_num[t] + 1) / (att_den[t] + 1)) ** lr)
+                attack[t]  = attack[t] * (1 - shrink_t) + shrink_t * a_tgt[t]
             if def_den[t] > 0:
-                defence[t] = defence[t] * ((def_num[t] / def_den[t]) ** lr)
-                defence[t] = defence[t] * (1 - shrink_t) + shrink_t
+                defence[t] = defence[t] * (((def_num[t] + 1) / (def_den[t] + 1)) ** lr)
+                defence[t] = defence[t] * (1 - shrink_t) + shrink_t * d_tgt[t]
         att_mean = math.exp(sum(math.log(v) for v in attack.values())  / len(teams))
         def_mean = math.exp(sum(math.log(v) for v in defence.values()) / len(teams))
         attack  = {t: v / att_mean for t, v in attack.items()}
@@ -486,7 +528,7 @@ def most_likely_score(matrix):
 
 
 def confidence_flag(lh, la, promoted):
-    if promoted:             return "PRIOR-BASED -- promoted, no 2025-26 PL data"
+    if promoted:             return "PRIOR-BASED -- promoted, no PL data to fit yet"
     if lh > 3.5 or la > 3.5: return "OVERFITTED -- goals markets only"
     if lh / max(la, 0.01) > 4 or la / max(lh, 0.01) > 4:
         return "EXTREME RATIO -- result markets unreliable"
@@ -604,27 +646,30 @@ def fetch_corner_matches(competition, season, limit=FETCH_LIMIT):
 
 
 def corner_ratings(competition, season, att, dff):
-    """-> (catt, cconc, avg_hc, avg_ac, phi, source)."""
+    """-> (catt, cconc, avg_hc, avg_ac, phi, source, home_mult). Fitted corner averages
+    already carry the home edge (home_mult 1.0); the proxy's neutral CORNER_BASE gets
+    HOME_CORNER_ADV once."""
     cm = list(CORNER_DATA) or fetch_corner_matches(competition, season)
     if len(cm) >= 10:
         catt, cconc, avg_hc, avg_ac = fit_team_ratings(
-            cm, home_advantage=HOME_CORNER_ADV, label="corners: ")
+            cm, label="corners: ")
         totals = [h + a for _, _, h, a, _ in cm]
         mean = sum(totals) / len(totals)
         var  = sum((t - mean) ** 2 for t in totals) / max(len(totals) - 1, 1)
         phi  = min(max(var / max(mean, 0.01), 1.0), 2.0)
-        return catt, cconc, avg_hc, avg_ac, phi, f"fitted on {len(cm)} corner matches"
+        return catt, cconc, avg_hc, avg_ac, phi, f"fitted on {len(cm)} corner matches", 1.0
     # No corner data -> derive corner form from the fitted GOAL ratings.
     catt  = {t: att[t] ** CORNER_PROXY_BETA for t in att}
     cconc = {t: dff[t] ** CORNER_PROXY_BETA for t in dff}
     return (catt, cconc, CORNER_BASE, CORNER_BASE, CORNER_DISPERSION,
-            "GOAL-RATING PROXY -- no corner data on this plan")
+            "GOAL-RATING PROXY -- no corner data on this plan", HOME_CORNER_ADV)
 
 
 def main():
     print("=" * 78)
-    print(f"  PREMIER LEAGUE  |  analyse {SEASON}-{SEASON+1} in full, "
-          f"then predict matchday 1 of {SEASON+1}-{SEASON+2}")
+    days = days_ahead()
+    print(f"  PREMIER LEAGUE  |  analyse {SEASON}-{SEASON+1} in full, fit it plus "
+          f"{CURRENT}-{CURRENT+1} so far, predict the next {days} days")
     print("=" * 78)
 
     # ---------------- STAGE 1: analyse every match of last season -------------
@@ -637,21 +682,34 @@ def main():
     table = analyse_season(recs)
     print_season_report(recs, table)
 
-    # ---------------- STAGE 2: fit those matches and apply -------------------
-    gv = goals_view(recs)
-    att, dff, avg_h, avg_a = fit_team_ratings(gv, HOME_ADV, label="goals: ")
-    rho = fit_rho(gv, att, dff, avg_h, avg_a, HOME_ADV)
+    # ---------------- STAGE 2: fit last season + this one so far, and apply -------
+    cur = fetch_season(COMPETITION, CURRENT)
+    fit_recs = recs + cur      # time-decay weights this season's matches most
+    # Promoted: in this season's data but not last season's (no extra API call).
+    last_teams = {r["home"] for r in recs} | {r["away"] for r in recs}
+    promoted = sorted(({r["home"] for r in cur} | {r["away"] for r in cur}) - last_teams)
+    priors = {t: (PROMOTED_ATT, PROMOTED_DEF) for t in promoted}
+    print(f"  Promoted sides (prior {PROMOTED_ATT}/{PROMOTED_DEF}, fading over "
+          f"{PRIOR_GAMES} games): {promoted or 'none with matches yet'}")
+    gv = goals_view(fit_recs)
+    att, dff, avg_h, avg_a = fit_team_ratings(gv, label="goals: ", priors=priors)
+    rho = fit_rho(gv, att, dff, avg_h, avg_a, 1.0)
     print_ratings(att, dff, avg_h, avg_a, rho)
 
-    hv = halftime_view(recs)
+    hv = halftime_view(fit_recs)
     ht_ok = len(hv) >= MIN_MATCHES
     if ht_ok:
-        h_att, h_dff, h_avg_h, h_avg_a = fit_team_ratings(hv, HOME_ADV, label="half-time: ")
+        h_att, h_dff, h_avg_h, h_avg_a = fit_team_ratings(hv, label="half-time: ", priors=priors)
     else:
         print(f"  Half-time scores on only {len(hv)} matches -> HT markets skipped.\n")
 
-    data_teams = sorted({r["home"] for r in recs} | {r["away"] for r in recs})
-    names = {t for f in FIXTURES for t in (f[0], f[1])}
+    fixtures = FIXTURES or fetch_fixtures(COMPETITION, days)
+    if not fixtures:
+        print(f"  No scheduled {COMPETITION} fixtures in the next {days} days "
+              "(international break?). Try --days 14.")
+        return
+    data_teams = sorted({r["home"] for r in fit_recs} | {r["away"] for r in fit_recs})
+    names = {t for f in fixtures for t in (f[0], f[1])}
     name_map, missing = {}, []
     print("  NAME RESOLUTION")
     for nm in sorted(names):
@@ -674,14 +732,14 @@ def main():
     def lam(home, away, a_tbl, d_tbl, base_h, base_a):
         h_att, h_def, h_new = ratings_for(home, a_tbl, d_tbl)
         a_att, a_def, a_new = ratings_for(away, a_tbl, d_tbl)
-        return (round(base_h * h_att * a_def * HOME_ADV, 3),
+        return (round(base_h * h_att * a_def, 3),
                 round(base_a * a_att * h_def, 3),
                 h_new or a_new)
 
     print("=" * 78)
-    print("  STAGE 2 -- MATCHDAY 1 PREDICTIONS: GOALS")
+    print("  STAGE 2 -- PREDICTIONS: GOALS")
     print("=" * 78)
-    for home, away, ko in FIXTURES:
+    for home, away, ko in fixtures:
         lh, la, is_new = lam(home, away, att, dff, avg_h, avg_a)
         ht = None
         if ht_ok:
@@ -690,17 +748,17 @@ def main():
         print_prediction(home, away, lh, la, ht=ht, kickoff=ko,
                          rho=rho, promoted=is_new)
 
-    catt, cconc, c_h, c_a, phi, csrc = corner_ratings(COMPETITION, SEASON, att, dff)
+    catt, cconc, c_h, c_a, phi, csrc, c_ha = corner_ratings(COMPETITION, SEASON, att, dff)
     print("=" * 78)
-    print(f"  STAGE 2 -- MATCHDAY 1 PREDICTIONS: CORNERS   ({csrc})")
+    print(f"  STAGE 2 -- PREDICTIONS: CORNERS   ({csrc})")
     print("=" * 78)
     pa_c, pd_c = PROMOTED_ATT ** CORNER_PROXY_BETA, PROMOTED_DEF ** CORNER_PROXY_BETA
-    for home, away, ko in FIXTURES:
+    for home, away, ko in fixtures:
         h_ca, h_cd, h_new = ratings_for(home, catt, cconc)
         a_ca, a_cd, a_new = ratings_for(away, catt, cconc)
         if h_new: h_ca, h_cd = pa_c, pd_c
         if a_new: a_ca, a_cd = pa_c, pd_c
-        lhc = round(c_h * h_ca * a_cd * HOME_CORNER_ADV, 3)
+        lhc = round(c_h * h_ca * a_cd * c_ha, 3)
         lac = round(c_a * a_ca * h_cd, 3)
         print_corner_prediction(home, away, lhc, lac, phi, kickoff=ko, source=csrc)
 

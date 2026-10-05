@@ -14,10 +14,14 @@ a particular league, competition or market. They are not interchangeable: they
 use different constants, different priors, and in places different modelling
 layers, because the competitions behave differently.
 
-These are useful for research and for thinking about where a bookmaker's price
-looks wrong. They are not guarantees, and they are not a betting system. There
-is no backtest in this repo, so treat the output as an estimate and judge it on
-its own merits.
+These are useful for research and as a fair-price sanity check. They are not
+guarantees, and they are not a betting system. `club_backtest.py` replays seven
+seasons against Pinnacle's odds, and the result is clear: the models are less
+accurate than the market and have no edge over it (closing-line value is
+negative in every league and market tested). Treat the output as an estimate.
+
+`docs/MODEL_CHANGES.md` describes the October 2026 changes and the evidence for
+each, and `docs/CLUB_BACKTEST_RESULTS.md` has the full backtest.
 
 ## What is in the repo
 
@@ -27,30 +31,46 @@ The standard general model. Dixon-Coles goals model with a corners predictor on
 top. Outputs 1X2, over/under 1.5, 2.5 and 3.5, both teams to score, the most
 likely scoreline, double chance, and corner markets. It is the only script that
 can read real corner counts from a second API if you have a key for one. Set
-the competition code and fixture list in `main()`.
+the competition code in `main()`. It fits the current season only, with no
+previous season and no priors, so it is the weakest of the four early in a
+season.
 
 ### `pl_model.py`
 
 A refined Premier League version. Adds a full analysis of a completed season,
-time-decay weighting so late-season form counts for more, sample-size
-shrinkage, a half-time model, a negative binomial on corner totals, priors for
-promoted clubs, and careful handling of club names. Home advantage is tuned for
-the league.
+then fits that season plus the current one so far, with time-decay weighting so
+recent form counts for more. Also sample-size shrinkage, a half-time model, a
+negative binomial on corner totals, measured priors for promoted clubs, and
+careful handling of club names. Home advantage comes from the league's own home
+and away scoring.
 
 ### `liga_portugal_model.py`
 
 A refined Liga Portugal version, built on the same two-stage shape as the
-Premier League script. Tuned separately: home advantage is noticeably stronger,
-the low-score correction fitted differently on real data, and name matching has
-to cope with accented spellings rather than clubs sharing common words.
+Premier League script. Tuned separately: home advantage, measured from the
+league's own scoring, is noticeably stronger, the low-score correction fits
+differently on real data, the promoted-club prior is its own, and name matching
+has to cope with accented spellings rather than clubs sharing common words.
 
 ### `cl_corners_model.py`
 
-A refined variant for the Champions League and the Championship, aimed at goals
-and corners in a simpler output format. Cut down on purpose, since knockout and
-cup competitions do not give you a full league season to fit against. It drops
-the time-decay, shrinkage and half-time layers, and prints a small correct
-score grid the league scripts do not.
+A variant for the Champions League and the Championship, aimed at goals and
+corners in a simpler output format. Both competitions are fitted on previous
+seasons plus the current one (three previous CL seasons, one previous
+Championship season), with time-decay and shrinkage. Measured priors cover new
+sides: relegated and promoted clubs in the Championship, and CL newcomers from
+outside the big five leagues. It has no half-time layer, and prints a small
+correct score grid the league scripts do not.
+
+### `club_backtest.py`
+
+The walk-forward backtest against Pinnacle's early and closing prices, for the
+Premier League, Championship and Liga Portugal. It uses each script's own
+fitting code, so it tests what the scripts actually do. It needs the
+football-data.co.uk CSVs, which `python club_backtest.py --fetch` downloads
+once into `data/clubs/`. It writes `docs/CLUB_BACKTEST_RESULTS.md`. Any
+modelling change should show positive closing-line value here before anyone
+stakes money on it.
 
 ## How the models work
 
@@ -70,15 +90,17 @@ scripts widen the range on corner totals instead of treating them like goals.
 The refined scripts add layers the standard model does not have. Weighting
 recent matches more heavily than early-season ones. Reducing how far a team's
 rating can drift when it has played few matches. A separate model fitted on
-half-time scores, for half-time markets. Newly promoted clubs get an assumed
-weak-side rating, since they have no top-flight record to fit against.
+half-time scores, for half-time markets. Newly promoted clubs start from a
+weak-side rating measured on past promoted sides, which fades as they build up
+their own record.
 
 Reliability improves once a season is under way and there is enough of a match
 record to fit. Early-season predictions are weak, and matchday one is the worst
 of the lot: it projects a May snapshot onto an August squad, across a summer of
-transfers and managerial changes. Promoted clubs stay shaky for longer, because
-their rating is an assumption rather than a measurement until they have played
-enough games. The scripts label those predictions rather than hiding them.
+transfers and managerial changes. Fitting last season alongside the current
+one softens this, but promoted clubs stay shaky for longer, because their
+rating leans on a prior until they have played enough games. The scripts label
+those predictions rather than hiding them.
 
 ## Data limits
 
@@ -146,12 +168,24 @@ python liga_portugal_model.py
 python cl_corners_model.py
 ```
 
-Fixtures and settings are constants near the top of each file, or in `main()`
-in the case of the standard model. The one setting worth knowing about is
-`SEASON`, which is keyed by the season's starting year, so 2025 means the
-2025-26 season. Always set it explicitly. Leaving it out asks the API for the
+Each script predicts every scheduled match in the next 7 days, fetched from
+the API. Add `--days 14` for a longer window, for example to reach the next
+Champions League matchday over an international break. To predict specific
+games instead, list them in `FIXTURES` near the top of the file (`CL_FIXTURES`
+and `ELC_FIXTURES` in `cl_corners_model.py`).
+
+The settings worth knowing about are the season constants, which are keyed by
+the season's starting year, so 2025 means the 2025-26 season. `SEASON` in the
+league scripts is the last completed season, and the current one
+(`SEASON + 1`) is fitted alongside it. `ELC_SEASON` and `CL_SEASON` in
+`cl_corners_model.py` are the seasons in progress. Bump all of them each
+August, and set them explicitly. Leaving the season out asks the API for the
 current season, which in August has no finished matches, and the scripts will
 quietly rate every team as average instead of failing.
+
+The free tier allows 10 requests a minute. `cl_corners_model.py` makes 9 or 10
+a run and waits out the limit if it hits it. The league scripts make fewer, but
+don't retry, so leave a minute between back-to-back runs.
 
 `SETUP.md` covers the same ground with a smoke test, and is the one to follow
 on a fresh clone.
