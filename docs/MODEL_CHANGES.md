@@ -24,6 +24,9 @@ them failing silently. They do not make them profitable.
 | Longer CL history for returning clubs | `cl_corners_model.py` | partly validated, see section 7 |
 | Club backtest against Pinnacle odds | `club_backtest.py` | no edge, see section 9 |
 | Seasons from today's date, rate-limit retry | all four | see section 10 |
+| Low-score correction fixed at 0 in the league fits | all four (not the CL fit) | no worse than refitting, see section 11 |
+| 1X2 shrink toward 0.5 removed | `pl_model.py`, `liga_portugal_model.py`, `regular_prediction_model.py` | PL 1X2 −0.0030 (t −3.0), Liga Portugal −0.0069 (t −6.2) |
+| Three likely scores printed instead of one | all four | see section 11 |
 
 ## 1. Home advantage applied once
 
@@ -174,14 +177,14 @@ earlier matches only, using each script's own fitting and scoring code.
 
 | | 1X2 log loss: model / Pinnacle early / Pinnacle close |
 |---|---|
-| Premier League (`pl_model.py`) | 0.985 / 0.962 / 0.958 |
-| Liga Portugal (`liga_portugal_model.py`) | 0.957 / 0.925 / 0.921 |
+| Premier League (`pl_model.py`) | 0.981 / 0.962 / 0.958 |
+| Liga Portugal (`liga_portugal_model.py`) | 0.950 / 0.925 / 0.921 |
 | Championship (`cl_corners_model.py`) | 1.052 / 1.040 / 1.038 |
 
-Every model is significantly less accurate than the market (t +5 to +8), and blending the model
-into the early price never helps, so the model carries no information the market lacks.
-Closing-line value is negative in every cell, from −2.6% to −4.6%, and ROI at early prices is
-negative too. Any future change meant for betting should show positive closing-line value here
+These figures include the changes in section 11. Every model is significantly less accurate than
+the market (t +5 to +7), and blending the model into the early price never helps, so the model
+carries no information the market lacks. Closing-line value is negative in every cell, from −2.7%
+to −4.6%, and ROI at early prices is negative too. Any future change meant for betting should show positive closing-line value here
 across leagues before anyone stakes money on it. There are no free CL odds, so the CL fit can't be
 tested this way.
 
@@ -218,6 +221,61 @@ Almost all of the gain comes from adding the second season. The prior's values c
 leagues, so that part is not an out-of-sample test. Like every model here, it has negative
 closing-line value.
 
+## 11. Low-score correction, 1X2 shrink and likely scores
+
+The "best score" line read 1-1 for most league matches, which prompted a check on 8,666
+walk-forward matches.
+
+Most of it is arithmetic. When both expected-goal figures lie between 1 and 2, the most likely score
+is 1-1, and that holds in 61% of league matches. It also matches reality: 1-1 is the most common
+score (12.0%, ahead of 1-0 at 10.3% and 2-1 at 8.8%). When the model picked 1-1 it priced it at
+12.0% and it happened 13.1% of the time, so the pick is calibrated. It just says little, because the
+runner-up score averages 10.4%. The scripts now print the three most likely scores instead of one.
+
+The Dixon-Coles correction (`rho`) made it worse, and that part was a real fault. A negative `rho`
+moves probability from 1-0 and 0-1 to 0-0 and 1-1. It was refitted on every run from about 400
+matches, and the fitted value was noise. The best value for a single season ranges from −0.13 to
++0.10 across 21 league-seasons, and one season's value does not predict the next (correlation
+−0.14). Pooled, the best value is 0.00, and refitting each week was no better than zero out of
+sample (exact score +0.0005, t +1.6). The Premier League's 2025-26 season happened to fit −0.13, the
+most negative of the 21, so `pl_model.py` was pricing every draw about three points too high. As a
+fixed value over all the test matches, −0.13 costs +0.0053 on exact scores (t +4.7) and +0.0014 on
+1X2 (t +2.3).
+
+`rho` is now fixed at 0 in `pl_model.py`, `liga_portugal_model.py`, `regular_prediction_model.py`
+and the Championship half of `cl_corners_model.py`. The scripts still compute the fitted value and
+print it for information. The Champions League fit keeps its fitted `rho`: it always lands on +0.05
+and beats zero on 1X2 there (−0.0025, t −2.4, 378 matches). Over/under prices do not depend on
+`rho`, since the correction only moves probability between scores with fewer than three goals.
+
+| 1X2 log loss | `rho` refitted | `rho` fixed at 0 | Δ (t) |
+|---|---|---|---|
+| Premier League | 0.9847 | 0.9843 | −0.0002 (−0.7) |
+| Liga Portugal | 0.9571 | 0.9570 | −0.0000 (−0.1) |
+| Championship | 1.0521 | 1.0517 | −0.0003 (−1.7) |
+
+The gain is not significant. The reason for the change is that it removes a fitted parameter that
+carried no signal.
+
+The same check turned up a larger problem in the 1X2 prices. The league scripts and the standard
+model pulled each 1X2 probability 8% toward 0.5, for full-time and half-time prices. That made
+favourites under-confident: sides priced at 65% or more (71% on average) won 80.6% of the time in
+the Premier League and 85.9% in Liga Portugal. The shrink is now off (`ONE_X_TWO_SHRINK = 0.0`).
+
+| 1X2 log loss | 8% shrink | No shrink | Δ (t) | Gap to Pinnacle's close |
+|---|---|---|---|---|
+| Premier League | 0.9843 | 0.9810 | −0.0030 (−3.0) | +0.0260 to +0.0226 |
+| Liga Portugal | 0.9570 | 0.9500 | −0.0069 (−6.2) | +0.0360 to +0.0290 |
+
+A separate walk-forward on half-time scores found no shrink neutral in the Premier League (t −0.1)
+and better in Liga Portugal (−0.0023, t −2.3). `cl_corners_model.py` never had a shrink.
+Closing-line value did not move (Premier League −2.7% to −2.8%, Liga Portugal −4.4%), so none of
+this creates an edge.
+
+Without the shrink, predicted full-time draws run slightly low at `rho` 0: 22.8% against 23.6%
+observed in the Premier League, and 23.8% against 25.0% in Liga Portugal. A small negative fixed
+`rho` would close that, but the difference in log loss is within noise, so `rho` stays at 0.
+
 ## Known limitations
 
 There is no edge (section 9).
@@ -234,3 +292,9 @@ Corners are a goal-rating proxy unless you have paid corner data.
 
 Hand-typed fixtures still rely on the `PROMOTED` name lists in the league scripts. Update them each
 summer if you type fixtures in rather than fetching them.
+
+The Champions League fit over-predicts draws. Over 378 walk-forward matches it priced 20.0% draws
+against 15.6% observed, and 1-1 at 8.6% against 5.3%, about two standard errors each. Actual goal
+difference runs at 1.26 times the predicted one (standard error 0.14), which suggests the CL ratings
+are too compressed. A stretch factor chosen on one season hurt the other, so nothing has been
+changed.

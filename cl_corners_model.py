@@ -96,10 +96,15 @@ CL_FIXTURES  = []
 ELC_FIXTURES = []
 
 # The Championship is a league, so it is fitted the way the league scripts are: the
-# previous season plus the current one so far, time-decayed, with a fitted rho. In the
-# club backtest this beat a current-season-only fit (docs/MODEL_CHANGES.md).
+# previous season plus the current one so far, time-decayed. In the club backtest this
+# beat a current-season-only fit (docs/MODEL_CHANGES.md).
 ELC_SEASON       = current_season()   # season in progress (starting year), from today's date
 ELC_DECAY        = 0.0035
+# Championship low-score correction (Dixon-Coles rho), fixed rather than refitted on each
+# run: one season's best value does not carry over to the next, and 0 was no worse than
+# refitting in the club backtest (docs/MODEL_CHANGES.md). The Champions League keeps its
+# fitted rho, which does beat 0 there.
+ELC_RHO          = 0.0
 # Priors for sides new to the division: their ratings start here and are shrunk back
 # toward them (not toward average) until their own results take over. Measured on
 # football-data.co.uk 2019-20 to 2025-26 as first-season goals scored / conceded per
@@ -420,19 +425,17 @@ def prob_to_odds(p):
     return f"{1/p:.2f}" if p > 0.0001 else "inf"
 
 
-def most_likely_score(matrix, max_goals=7):
-    best_p, best = 0.0, (0, 0)
-    for i in range(max_goals + 1):
-        for j in range(max_goals + 1):
-            if matrix[i][j] > best_p:
-                best_p = matrix[i][j]; best = (i, j)
-    return best, best_p
+def top_scores(matrix, k=3):
+    """The k most likely scorelines -> [((home, away), probability), ...]. A single
+    'best score' says little: in most league matches it is 1-1 at about 12%, barely
+    ahead of the next one."""
+    cells = [((i, j), p) for i, row in enumerate(matrix) for j, p in enumerate(row)]
+    return sorted(cells, key=lambda c: -c[1])[:k]
 
 
 def print_prediction(home, away, lh, la, league=None, kickoff=None, note=None, rho=-0.13):
     matrix  = build_score_matrix(lh, la, rho)
     summary = summarize_matrix(matrix)
-    ml, mlp = most_likely_score(matrix)
 
     print("=" * 72)
     tag = f"[{league}]" if league else ""
@@ -449,7 +452,7 @@ def print_prediction(home, away, lh, la, league=None, kickoff=None, note=None, r
           f"O2.5 {summary['over_2_5']*100:5.1f}%  "
           f"O3.5 {summary['over_3_5']*100:5.1f}%")
     print(f"  BTTS:  Yes {summary['btts_yes']*100:5.1f}%   No {summary['btts_no']*100:5.1f}%")
-    print(f"  Best score: {ml[0]}-{ml[1]}  ({mlp*100:.1f}%)")
+    print("  Likely scores: " + ", ".join(f"{i}-{j} {p*100:.1f}%" for (i, j), p in top_scores(matrix)))
 
     h4, a4 = home[:4], away[:4]
     print(f"\n  {'':6s}  {a4+'0':7s}{a4+'1':7s}{a4+'2':7s}{a4+'3':7s}")
@@ -580,7 +583,7 @@ def main():
     print("Dixon-Coles Poisson Model  (goals + corners)")
     print("=" * 72)
 
-    RHO = -0.13
+    RHO = -0.13   # Champions League fallback only, when there is no CL data to fit
 
     print(f"\nFetching Champions League data (previous {CL_HISTORY} seasons + current so far)...")
     cl_prev = [m for back in range(CL_HISTORY, 0, -1) for m in fetch_season("CL", CL_SEASON - back)]
@@ -636,15 +639,16 @@ def main():
         elc_teams = {t for m in elc_matches for t in m[:2]}
         elc_att, elc_def, elc_avg_h, elc_avg_a = fit_league_ratings(
             elc_matches, priors={t: elc_prior(t) for t in elc_teams})
-        elc_rho = fit_rho_league(elc_matches, elc_att, elc_def, elc_avg_h, elc_avg_a)
-        print(f"  Championship rho: {elc_rho}")
+        elc_rho = ELC_RHO
+        print(f"  Championship rho: fixed at {ELC_RHO} (refitting on this sample alone would give "
+              f"{fit_rho_league(elc_matches, elc_att, elc_def, elc_avg_h, elc_avg_a)}; not used)")
         print(f"  Relegated (prior {ELC_RELEGATED_ATT}/{ELC_RELEGATED_DEF}): "
               f"{sorted(t for t in elc_teams if t in pl_prev_teams)}")
         print(f"  Promoted  (prior {ELC_PROMOTED_ATT}/{ELC_PROMOTED_DEF}): "
               f"{sorted(t for t in elc_teams if elc_prior(t) == (ELC_PROMOTED_ATT, ELC_PROMOTED_DEF))}")
     else:
         print("  Not enough ELC data -- using neutral ratings.")
-        elc_att = {}; elc_def = {}; elc_avg_h = 1.50; elc_avg_a = 1.15; elc_rho = RHO
+        elc_att = {}; elc_def = {}; elc_avg_h = 1.50; elc_avg_a = 1.15; elc_rho = ELC_RHO
 
     # Home advantage is applied once: the fitted (or fallback) home/away averages
     # already carry it, so no CL/ELC multiplier goes on top (docs/MODEL_CHANGES.md).

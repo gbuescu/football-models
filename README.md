@@ -28,8 +28,8 @@ each, and `docs/CLUB_BACKTEST_RESULTS.md` has the full backtest.
 ### `regular_prediction_model.py`
 
 The standard general model. Dixon-Coles goals model with a corners predictor on
-top. Outputs 1X2, over/under 1.5, 2.5 and 3.5, both teams to score, the most
-likely scoreline, double chance, and corner markets. It is the only script that
+top. Outputs 1X2, over/under 1.5, 2.5 and 3.5, both teams to score, the three
+most likely scorelines, double chance, and corner markets. It is the only script that
 can read real corner counts from a second API if you have a key for one. Set
 the competition code in `main()`. Like the league scripts, it fits last season
 plus the current one so far, and gives sides new this season a fading
@@ -50,9 +50,9 @@ and away scoring.
 
 A refined Liga Portugal version, built on the same two-stage shape as the
 Premier League script. Tuned separately: home advantage, measured from the
-league's own scoring, is noticeably stronger, the low-score correction fits
-differently on real data, the promoted-club prior is its own, and name matching
-has to cope with accented spellings rather than clubs sharing common words.
+league's own scoring, is noticeably stronger, the promoted-club prior is its
+own, and name matching has to cope with accented spellings rather than clubs
+sharing common words.
 
 ### `cl_corners_model.py`
 
@@ -83,11 +83,14 @@ home advantage figure for the competition. Put two teams together and those
 ratings give an expected goals figure for each, which turns into a probability
 for every plausible scoreline, and from there into prices for the markets.
 
-Two adjustments sit on top of that. Low-scoring matches happen slightly more
-often than the plain arithmetic suggests, particularly 0-0 and 1-1, so there is
-a correction for that, fitted from the season's own data rather than assumed.
 Corners behave differently from goals, being more spread out, so the league
 scripts widen the range on corner totals instead of treating them like goals.
+
+The scripts also carry the Dixon-Coles low-score correction, which moves
+probability between 0-0, 1-0, 0-1 and 1-1. In the league fits it is fixed at
+zero. It used to be refitted on every run, and the fitted value turned out to
+be noise: what suited one season said nothing about the next. The Champions
+League fit still estimates it. `docs/MODEL_CHANGES.md` has the evidence.
 
 The refined scripts add layers the standard model does not have. Weighting
 recent matches more heavily than early-season ones. Reducing how far a team's

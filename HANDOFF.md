@@ -104,11 +104,21 @@ corners exist. Measured effect at mu=10.2: Over 7.5 moved from 79.7% to 76.7%,
 Over 13.5 from 15.1% to 17.4%. Goals stay Poisson with the Dixon-Coles
 correction.
 
-**`rho` differs by league and that is correct.** Fitted by log-likelihood grid.
-Real data gave -0.13 for the Premier League (with home advantage applied once)
-and 0.0 for Liga Portugal, which genuinely showed no low-score correction last
-season. A synthetic-data test returns exactly 0.0, which validates the fitter,
-since that test data is independent-Poisson by construction.
+**`rho` is fixed at 0 in the league fits.** It used to be refitted on every run
+by a log-likelihood grid, and the result looked like a real difference between
+leagues: -0.13 for the Premier League, 0.0 for Liga Portugal. It was noise.
+Across 21 league-seasons the best value ranges from -0.13 to +0.10, and one
+season does not predict the next. Refitting was no better than zero out of
+sample, and in an unusual season it skewed every draw price. The fitted value
+is still printed for information. The Champions League fit keeps its fitted
+`rho`, which does beat zero there. Do not go back to refitting in the leagues
+without rerunning `club_backtest.py`.
+
+**No 1X2 shrink.** The league scripts and the standard model used to pull each
+1X2 probability 8% toward 0.5. That made favourites under-confident: sides
+priced at 65% or more won over 80% of the time. `ONE_X_TWO_SHRINK` is 0 now.
+The mechanism is still there, so leave it off unless the backtest says
+otherwise.
 
 **Home advantage is applied once.** It comes from each competition's own
 decay-weighted home and away goal averages. The scripts used to multiply a

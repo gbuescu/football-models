@@ -12,8 +12,8 @@ DAYS_AHEAD days (--days N), unless FIXTURES lists specific games.
 
 Tuned separately from the Premier League version. Home advantage is the
 season's own home/away goal split, applied once (docs/MODEL_CHANGES.md; 1.26 in
-2025-26, much like the PL), and the fitted rho came out at 0.0 on real data: this
-league genuinely showed no low-score correction last season. Name resolution is
+2025-26, much like the PL). The low-score correction (rho) is fixed at 0, as in
+the other league fits. Name resolution is
 simpler here than in pl_model.py, because Portuguese club names do not collide
 on shared tokens the way the English ones do, but it does have to cope with
 accents.
@@ -91,7 +91,17 @@ MIN_MATCHES = 40             # below this the ratings are meaningless
 # away goal averages already carry it, so it is applied exactly once. A hand-set
 # HOME_ADV used to multiply on top and double-count it (docs/MODEL_CHANGES.md).
 DECAY       = 0.0035         # time-decay, so late-season form outweighs August
-RHO_DEFAULT = -0.13          # only a starting point; fit_rho found 0.0 on real data
+# Dixon-Coles low-score correction, fixed rather than refitted on each run. The value
+# that best fits one season does not carry over to the next (-0.13 to +0.10 across 21
+# league-seasons, with no persistence), 0 is the pooled optimum, and refitting was no
+# better than 0 in the club backtest (docs/MODEL_CHANGES.md). fit_rho() still runs, and its
+# result is printed for information only.
+RHO         = 0.0
+# Shrink of each 1X2 probability toward 0.5 (0 = off). It used to be 0.08, which made
+# favourites under-confident: sides priced at 65% or more won about 81% (PL) and 86% (PPL)
+# of the time. Without it 1X2 log loss improves in the club backtest and the half-time
+# prices are no worse (docs/MODEL_CHANGES.md).
+ONE_X_TWO_SHRINK = 0.0
 
 # Promoted sides have no top-flight record to fit against. Attack below 1 means
 # scores less than league average, defence above 1 means concedes more. Measured on
@@ -412,7 +422,7 @@ def fit_team_ratings(matches, home_advantage=1.0, n_iter=300, lr=0.01,
 
 
 def fit_rho(matches, attack, defence, avg_home, avg_away, home_advantage):
-    best_rho, best_ll = RHO_DEFAULT, float("-inf")
+    best_rho, best_ll = RHO, float("-inf")
     for rho_test in [-0.25, -0.20, -0.18, -0.15, -0.13, -0.10, -0.08, -0.05, 0.0, 0.05]:
         ll = 0.0
         for h, a, hg, ag, _ in matches:
@@ -427,7 +437,7 @@ def fit_rho(matches, attack, defence, avg_home, avg_away, home_advantage):
     return best_rho
 
 
-def calibrate_probability(p, strength=0.08):
+def calibrate_probability(p, strength=ONE_X_TWO_SHRINK):
     return p * (1 - strength) + 0.5 * strength
 
 
@@ -450,7 +460,7 @@ def nb_pmf(k, mu, phi):
                     + r * math.log(p) + k * math.log(1.0 - p))
 
 
-def dixon_coles_tau(i, j, lh, la, rho=RHO_DEFAULT):
+def dixon_coles_tau(i, j, lh, la, rho=RHO):
     if   i == 0 and j == 0: return 1 - lh * la * rho
     elif i == 1 and j == 0: return 1 + la * rho
     elif i == 0 and j == 1: return 1 + lh * rho
@@ -458,7 +468,7 @@ def dixon_coles_tau(i, j, lh, la, rho=RHO_DEFAULT):
     else:                   return 1.0
 
 
-def build_score_matrix(lh, la, rho=RHO_DEFAULT, max_goals=7):
+def build_score_matrix(lh, la, rho=RHO, max_goals=7):
     ph = [poisson_pmf(i, lh) for i in range(max_goals + 1)]
     pa = [poisson_pmf(j, la) for j in range(max_goals + 1)]
     m = [[ph[i] * pa[j] * dixon_coles_tau(i, j, lh, la, rho)
@@ -495,14 +505,12 @@ def prob_to_odds(p):
     return f"{1/p:.2f}" if p > 0.0001 else "inf"
 
 
-def most_likely_score(matrix):
-    n = len(matrix)
-    best_p, best = 0.0, (0, 0)
-    for i in range(n):
-        for j in range(n):
-            if matrix[i][j] > best_p:
-                best_p, best = matrix[i][j], (i, j)
-    return best, best_p
+def top_scores(matrix, k=3):
+    """The k most likely scorelines -> [((home, away), probability), ...]. A single
+    'best score' says little: in most league matches it is 1-1 at about 12%, barely
+    ahead of the next one."""
+    cells = [((i, j), p) for i, row in enumerate(matrix) for j, p in enumerate(row)]
+    return sorted(cells, key=lambda c: -c[1])[:k]
 
 
 def confidence_flag(lh, la, promoted):
@@ -515,10 +523,9 @@ def confidence_flag(lh, la, promoted):
 
 
 def print_prediction(home, away, lh, la, ht=None, kickoff=None,
-                     rho=RHO_DEFAULT, promoted=False):
+                     rho=RHO, promoted=False):
     matrix = build_score_matrix(lh, la, rho)
     s = summarize_matrix(matrix)
-    ml, mlp = most_likely_score(matrix)
     print("=" * 78)
     print(f"  [Liga Portugal] [{kickoff}]")
     print(f"  {home}  vs  {away}")
@@ -531,7 +538,7 @@ def print_prediction(home, away, lh, la, ht=None, kickoff=None,
     print(f"  O/U :  O1.5 {s['over_1_5']*100:5.1f}%  O2.5 {s['over_2_5']*100:5.1f}%  "
           f"O3.5 {s['over_3_5']*100:5.1f}%")
     print(f"  BTTS:  Yes {s['btts_yes']*100:5.1f}%   No {s['btts_no']*100:5.1f}%")
-    print(f"  Best score: {ml[0]}-{ml[1]}  ({mlp*100:.1f}%)")
+    print("  Likely scores: " + ", ".join(f"{i}-{j} {p*100:.1f}%" for (i, j), p in top_scores(matrix)))
     print(f"  WDW home: {(s['home']+s['draw'])*100:.1f}%   "
           f"WDW away: {(s['away']+s['draw'])*100:.1f}%")
     if ht:
@@ -671,7 +678,9 @@ def main():
           f"{PRIOR_GAMES} games): {promoted or 'none with matches yet'}")
     gv = goals_view(fit_recs)
     att, dff, avg_h, avg_a = fit_team_ratings(gv, label="goals: ", priors=priors)
-    rho = fit_rho(gv, att, dff, avg_h, avg_a, 1.0)
+    rho = RHO
+    print(f"  rho fixed at {RHO} (refitting on this sample alone would give "
+          f"{fit_rho(gv, att, dff, avg_h, avg_a, 1.0)}; not used)")
     print_ratings(att, dff, avg_h, avg_a, rho)
 
     hv = halftime_view(fit_recs)

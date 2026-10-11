@@ -84,9 +84,16 @@ CONFIGS = [
     ("PPL: regular_prediction_model.py", "P1", "regular_prediction_model", "regular"),
     ("PL: regular, current season only (old)", "E0", "regular_prediction_model", "regular_old"),
     ("PPL: regular, current season only (old)", "P1", "regular_prediction_model", "regular_old"),
+    ("PL: rho refitted each week (old)", "E0", "pl_model", "two_seasons_fitted_rho"),
+    ("PPL: rho refitted each week (old)", "P1", "liga_portugal_model", "two_seasons_fitted_rho"),
+    ("ELC: rho refitted each week (old)", "E1", "cl_corners_model", "league_fitted_rho"),
+    ("PL: with the old 8% 1X2 shrink", "E0", "pl_model", "two_seasons_old_shrink"),
+    ("PPL: with the old 8% 1X2 shrink", "P1", "liga_portugal_model", "two_seasons_old_shrink"),
 ]
 THRESHOLDS = (0.0, 0.05, 0.10)   # minimum model edge (EV at the early price) to bet
 OLD_NEWCOMER_PRIOR = (0.80, 1.20)  # what every new Championship side got before 2026-10-04
+OLD_ONE_X_TWO_SHRINK = 0.08        # the league scripts' 1X2 shrink toward 0.5 before 2026-10-11
+OLD_SHRINK_METHODS = ("two_seasons_old_shrink", "regular_old")
 
 Match = namedtuple("Match", "season day home away hg ag open1x2 close1x2 open_ou close_ou")
 Pred = namedtuple("Pred", "match p1x2 p_over")
@@ -218,15 +225,17 @@ def predict_week(module, method, history, before, week, priors=None):
     `priors` ({team: (attack, defence)}) is used by the Championship league fit."""
     priors = priors or {}
     team_prior = None
-    if method in ("two_seasons", "two_seasons_old_prior"):
+    if method in ("two_seasons", "two_seasons_old_prior", "two_seasons_fitted_rho", "two_seasons_old_shrink"):
         gv = [(m.home, m.away, m.hg, m.ag, m.day.isoformat()) for m in history + before]
         with contextlib.redirect_stdout(io.StringIO()):
-            if method == "two_seasons":   # fading promoted prior, as the scripts now run
+            if method != "two_seasons_old_prior":   # fading promoted prior, as the scripts now run
                 att, dff, avg_h, avg_a = module.fit_team_ratings(gv, priors=priors)
-            else:                         # before: shrink everyone toward 1.0
+            else:                                   # before: shrink everyone toward 1.0
                 att, dff, avg_h, avg_a = old_fit_team_ratings(module, gv)
-            rho = module.fit_rho(gv, att, dff, avg_h, avg_a, 1.0)
-        if method == "two_seasons":
+            # The scripts' fixed rho, except in the comparison rows that refit it as before.
+            rho = (module.fit_rho(gv, att, dff, avg_h, avg_a, 1.0)
+                   if method == "two_seasons_fitted_rho" else module.RHO)
+        if method != "two_seasons_old_prior":
             prior_att = prior_def = 1.0
             team_prior = lambda t: priors.get(t, (module.PROMOTED_ATT, module.PROMOTED_DEF))
         else:
@@ -235,7 +244,7 @@ def predict_week(module, method, history, before, week, priors=None):
         gv = [(m.home, m.away, m.hg, m.ag, m.day.isoformat()) for m in history + before]
         with contextlib.redirect_stdout(io.StringIO()):
             att, dff, avg_h, avg_a = module.fit_team_ratings(gv, priors=priors)
-            rho = module.fit_rho(gv, att, dff, avg_h, avg_a, 1.0)
+        rho = module.RHO
         prior_att, prior_def = module.NEWCOMER_ATT, module.NEWCOMER_DEF
     elif method == "regular_old":   # the standard model before: current season only
         if len(before) >= 10:
@@ -246,16 +255,17 @@ def predict_week(module, method, history, before, week, priors=None):
         else:
             att, dff, avg_h, avg_a, rho = {}, {}, 1.50, 1.15, -0.13
         prior_att = prior_def = 1.0
-    elif method == "league":   # cl_corners_model's Championship fit, with division priors
+    elif method in ("league", "league_fitted_rho"):   # cl_corners_model's Championship fit, division priors
         gv = [(m.home, m.away, m.hg, m.ag, m.day.isoformat()) for m in history + before]
         att, dff, avg_h, avg_a = module.fit_league_ratings(gv, priors=priors)
-        rho = module.fit_rho_league(gv, att, dff, avg_h, avg_a)
+        rho = (module.fit_rho_league(gv, att, dff, avg_h, avg_a)
+               if method == "league_fitted_rho" else module.ELC_RHO)
         prior_att = prior_def = 1.0
         team_prior = lambda t: priors.get(t, (1.0, 1.0))
     elif method == "league_old_prior":   # the same fit before division priors
         gv = [(m.home, m.away, m.hg, m.ag, m.day.isoformat()) for m in history + before]
         att, dff, avg_h, avg_a = module.fit_league_ratings(gv)
-        rho = module.fit_rho_league(gv, att, dff, avg_h, avg_a)
+        rho = module.ELC_RHO
         prior_att, prior_def = OLD_NEWCOMER_PRIOR
     else:   # cl_corners_model: current season only, neutral fallback below 10 matches
         if len(before) >= 10:
@@ -271,7 +281,11 @@ def predict_week(module, method, history, before, week, priors=None):
         a_att, a_def = att.get(m.away, ap[0]), dff.get(m.away, ap[1])
         lh, la = round(avg_h * h_att * a_def, 3), round(avg_a * a_att * h_def, 3)
         s = module.summarize_matrix(module.build_score_matrix(lh, la, rho))
-        preds.append(Pred(m, (s["home"], s["draw"], s["away"]), s["over_2_5"]))
+        p1x2 = (s["home"], s["draw"], s["away"])
+        if method in OLD_SHRINK_METHODS:   # put the old shrink back, for the comparison rows
+            v = [p * (1 - OLD_ONE_X_TWO_SHRINK) + 0.5 * OLD_ONE_X_TWO_SHRINK for p in p1x2]
+            p1x2 = tuple(x / sum(v) for x in v)
+        preds.append(Pred(m, p1x2, s["over_2_5"]))
     return preds
 
 
@@ -279,15 +293,15 @@ def run_config(config):
     label, div, module_name, method = config
     module = __import__(module_name)
     by_season = load_league(div)
-    e0 = load_league("E0") if method == "league" else None
+    e0 = load_league("E0") if method in ("league", "league_fitted_rho") else None
     preds = []
     for prev, season in zip(SEASONS, SEASONS[1:]):
         current = by_season[season]
         priors = {}
-        if method == "league":
+        if method in ("league", "league_fitted_rho"):
             values = newcomer_priors(e0, by_season, exclude=season)
             priors = {t: values[kind] for t, kind in newcomers(e0, by_season, prev, season).items()}
-        elif method == "two_seasons":
+        elif method in ("two_seasons", "two_seasons_fitted_rho", "two_seasons_old_shrink"):
             value = promoted_priors(by_season, exclude=season)
             priors = {t: value for t in teams_of(current) - teams_of(by_season[prev])}
         elif method == "regular":   # a fixed generic prior, not measured per league
@@ -404,6 +418,11 @@ def main():
            "(0.73/1.16, between the measured PL and Primeira Liga values, so not out of sample for those "
            "two leagues); its \"old\" rows are the script before 2026-10-05, fitted on the current season "
            "only with unseen sides at 1.0.",
+           "- **Low-score correction (rho):** every row uses the scripts' fixed value (0), except the "
+           "\"rho refitted each week\" rows, which refit it on the data before each week as the scripts did "
+           "before 2026-10-11, and the two older \"current season only\" rows.",
+           "- **1X2 shrink:** the league scripts and the standard model no longer pull 1X2 probabilities toward "
+           "0.5. The \"old 8% 1X2 shrink\" rows and the standard model's \"old\" rows put it back.",
            "- **Market:** Pinnacle. The *early* price (PSH/PSD/PSA, P>2.5/P<2.5) is collected on Friday for "
            "weekend games and Tuesday for midweek, which is when you would run the scripts. The *closing* price is "
            "PSCH/PSCD/PSCA and PC>2.5/PC<2.5. Margins are removed proportionally to get fair probabilities.",
@@ -480,13 +499,24 @@ def main():
             ("regular: two seasons + newcomer prior − old current-season-only fit, PPL",
              "PPL: regular_prediction_model.py", "PPL: regular, current season only (old)", lambda m: True),
             ("regular: same, PPL, first 10 weeks of each season", "PPL: regular_prediction_model.py",
-             "PPL: regular, current season only (old)", early({s: teams_of(p1[s]) for s in SEASONS[1:]}, p1))]
+             "PPL: regular, current season only (old)", early({s: teams_of(p1[s]) for s in SEASONS[1:]}, p1)),
+            ("PL: fixed rho − rho refitted each week", "PL: pl_model.py",
+             "PL: rho refitted each week (old)", lambda m: True),
+            ("PPL: fixed rho − rho refitted each week", "PPL: liga_portugal_model.py",
+             "PPL: rho refitted each week (old)", lambda m: True),
+            ("ELC: fixed rho − rho refitted each week", "ELC: cl_corners_model.py",
+             "ELC: rho refitted each week (old)", lambda m: True),
+            ("PL: no 1X2 shrink − old 8% shrink", "PL: pl_model.py",
+             "PL: with the old 8% 1X2 shrink", lambda m: True),
+            ("PPL: no 1X2 shrink − old 8% shrink", "PPL: liga_portugal_model.py",
+             "PPL: with the old 8% 1X2 shrink", lambda m: True)]
     out += ["", "**Model-change comparisons (per-match log loss over all test matches; negative = first is better; "
             "ELC rows compare Championship versions):**", "",
             "| Comparison | Matches | Δ 1X2 (t) | Δ O/U 2.5 (t) |", "|---|---|---|---|"]
+    cell = lambda r: "identical" if r[1] == 0 else f"{r[0]:+.4f} ({r[2]:+.1f})"   # e.g. O/U under a 1X2-only change
     for text, a, b, keep in rows:
         r1, ro, n = paired_ll(a, b, keep)
-        out.append(f"| {text} | {n} | {r1[0]:+.4f} ({r1[2]:+.1f}) | {ro[0]:+.4f} ({ro[2]:+.1f}) |")
+        out.append(f"| {text} | {n} | {cell(r1)} | {cell(ro)} |")
     out.append("")
     out += ["", "## 2. Betting at Pinnacle's early price", "",
             "| Model | Market | Min edge | Bets | ROI (t) | CLV (t) |", "|---|---|---|---|---|---|"]
