@@ -1,0 +1,35 @@
+# Local configuration: may hold your own settings, never commit it
+config/homeminer.toml
+config/*.local.toml
+.env
+.env.*
+
+# Miner binaries you approved and downloaded (re-download from the official release)
+tools/
+
+# Runtime data: benchmark results, market cache, ledger, payout address, logs
+data/
+results/
+logs/
+*.log
+diagnostics*.json
+# Synthetic test fixtures are part of the repo (the parent repo ignores *.log and *.csv)
+!tests/fixtures/*.log
+!tests/fixtures/*.csv
+diagnostics*.txt
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

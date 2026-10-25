@@ -1,0 +1,99 @@
+# HomeMiner sample configuration.
+#
+# Copy this file to config/homeminer.toml (git-ignored) and edit the copy.
+# Never put wallet addresses, seed phrases, private keys, account names,
+# API keys or passwords in any configuration file. HomeMiner refuses to load
+# a configuration that looks like it contains one.
+
+[general]
+# Empty means %LOCALAPPDATA%\HomeMiner on Windows (~/.local/share/homeminer elsewhere).
+data_dir = ""
+# Approved miner releases are extracted here. Relative paths are relative to the project folder.
+tools_dir = "tools"
+# HomeMiner will not launch a miner from an Administrator session unless this is true.
+allow_elevated = false
+
+[economics]
+# User-supplied assumption. Editable in the UI.
+electricity_eur_per_kwh = 0.00
+# Optional allowance for hardware wear. Excluded (0) by default; see the README.
+wear_cost_eur_per_day = 0.00
+# A withdrawal counts as "economic" once its fixed fee is at most this share of the amount.
+withdrawal_fee_target_pct = 5.0
+
+[limits]
+# XMRig --cpu-max-threads-hint: percentage of logical processors to use (1-100).
+cpu_max_threads_hint = 50
+# XMRig --cpu-priority: 0 (idle) to 5 (highest). 0 keeps the desktop responsive.
+cpu_priority = 0
+# Stop GPU work above this temperature.
+gpu_temp_limit_c = 80
+# Stop CPU work above this temperature, when a CPU temperature sensor is readable.
+cpu_temp_limit_c = 90
+# Use huge pages only if Windows already grants "Lock pages in memory". HomeMiner never grants it.
+huge_pages = true
+# Hard stop for any single benchmark.
+max_benchmark_minutes = 45
+
+[benchmark]
+cpu_algorithm = "rx/0"
+# XMRig benchmark sizes: 250K, 500K, 1M ... 10M hashes.
+cpu_size = "1M"
+gpu_algorithm = "rx/0"
+gpu_size = "250K"
+sample_interval_s = 2.0
+# Benchmarks never run at the same time unless you change this, and results are flagged if you do.
+allow_simultaneous = false
+
+[power]
+# Model used only when no measurement exists. Replace with a wall-meter reading when you can.
+cpu_idle_watts = 10
+cpu_full_load_watts = 65
+# GTX 970 reference board power, used only if nvidia-smi cannot read the power sensor.
+gpu_board_power_watts = 145
+# Measured extra watts at the wall while each benchmark runs (0 = not measured).
+wall_meter_cpu_watts = 0
+wall_meter_gpu_watts = 0
+
+[market]
+max_quote_age_minutes = 30
+timeout_s = 15
+nicehash_api = "https://api2.nicehash.com"
+mempool_api = "https://mempool.space/api"
+blockchain_info_api = "https://blockchain.info"
+coingecko_api = "https://api.coingecko.com/api/v3"
+
+[fees.nicehash]
+# Found on NiceHash support pages on 2026-10-25 through search results; the pages
+# could not be opened directly. Confirm on nicehash.com, then set verification = "primary".
+verified_on = "2026-10-25"
+verification = "secondary"
+mining_fee_pct = 2.0
+payout_min_btc = 0.00001
+payout_interval_hours = 4
+withdrawal_fee_btc_onchain = 0.0001
+withdrawal_min_btc_onchain = 0.0002
+inactive_funds_days = 60
+source = "https://www.nicehash.com/support/mining-help/earnings-and-payments/when-and-how-do-you-get-paid"
+
+[miners.xmrig]
+version = "6.26.0"
+asset = "xmrig-6.26.0-windows-x64.zip"
+release_url = "https://github.com/xmrig/xmrig/releases/tag/v6.26.0"
+download_base = "https://github.com/xmrig/xmrig/releases/download/v6.26.0"
+# XMRig's built-in donation while pool mining (official builds do not go below 1%).
+donate_level_pct = 1
+
+[miners.xmrig_cuda]
+version = "6.22.1"
+asset = "xmrig-cuda-6.22.1-cuda12_9-win64.zip"
+release_url = "https://github.com/xmrig/xmrig-cuda/releases/tag/v6.22.1"
+download_base = "https://github.com/xmrig/xmrig-cuda/releases/download/v6.22.1"
+
+[mining]
+# Real mining stays off until you set this to true AND confirm in the UI each session.
+approved = false
+route = "nicehash"
+# Check this against NiceHash's current stratum list before first use.
+nicehash_stratum = "stratum+ssl://randomxmonero.auto.nicehash.com:443"
+worker_name = "homeminer"
