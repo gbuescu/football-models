@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HomeMiner</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div>
+      <h1>HomeMiner</h1>
+      <div class="sub">Benchmarks and BTC payout estimates for this PC</div>
+    </div>
+    <span id="status" class="pill">Connecting…</span>
+    <div class="spacer"></div>
+    <button id="emergency" class="emergency" title="Kill every miner process immediately (Ctrl+Shift+X)">EMERGENCY STOP</button>
+  </header>
+
+  <main>
+    <div id="banner" class="banner">Nothing runs until you press Start. Benchmarks are offline. Real mining stays off unless you approve it in your config and confirm it here.</div>
+
+    <div class="grid">
+      <section class="card" id="hardware">
+        <h2>Hardware status</h2>
+        <div id="hw-body" class="muted">Loading…</div>
+        <div class="actions"><button id="btn-discover">Run discovery (read-only)</button></div>
+      </section>
+
+      <section class="card" id="monitor">
+        <h2>Temperature and hash-rate monitoring</h2>
+        <div id="mon-body" class="tiles"></div>
+        <p class="src" id="mon-src"></p>
+      </section>
+
+      <section class="card" id="cpu-bench">
+        <h2>CPU benchmark</h2>
+        <div id="cpu-body"></div>
+        <div class="actions">
+          <button data-bench="cpu" data-dry="1">Dry run</button>
+          <button class="primary" data-bench="cpu" data-dry="0">Start CPU benchmark</button>
+          <button data-action="stop">Stop</button>
+        </div>
+      </section>
+
+      <section class="card" id="gpu-bench">
+        <h2>GPU benchmark</h2>
+        <div id="gpu-body"></div>
+        <div class="actions">
+          <button data-bench="gpu" data-dry="1">Dry run</button>
+          <button class="primary" data-bench="gpu" data-dry="0">Start GPU benchmark</button>
+          <button data-action="stop">Stop</button>
+        </div>
+      </section>
+
+      <section class="card wide" id="routes">
+        <h2>BTC payout route comparison</h2>
+        <div id="routes-body"></div>
+      </section>
+
+      <section class="card" id="assumptions">
+        <h2>Live profitability assumptions</h2>
+        <form class="inline" id="settings-form"></form>
+        <h3>Market data</h3>
+        <div id="market-body"></div>
+        <div class="actions"><button id="btn-market">Refresh market data</button></div>
+      </section>
+
+      <section class="card" id="estimates">
+        <h2>Estimated earnings and fees</h2>
+        <div id="est-body"></div>
+      </section>
+
+      <section class="card" id="ledger">
+        <h2>Earnings ledger</h2>
+        <p class="muted">Four separate things, never added together. You enter the last three from the marketplace dashboard and your own wallet app.</p>
+        <div id="ledger-body"></div>
+        <div class="row">
+          <select id="ledger-kind">
+            <option value="unpaid_balance">Unpaid balance (marketplace)</option>
+            <option value="confirmed_pool">Paid into marketplace account</option>
+            <option value="received_in_wallet">Received in my wallet</option>
+          </select>
+          <input id="ledger-amount" class="num" placeholder="BTC" inputmode="decimal" autocomplete="off">
+          <input id="ledger-source" class="grow" placeholder="Where from (e.g. NiceHash dashboard)" autocomplete="off">
+          <button id="btn-ledger">Add</button>
+        </div>
+      </section>
+
+      <section class="card" id="mining">
+        <h2>Mining controls</h2>
+        <div id="mining-body"></div>
+        <div class="row">
+          <input id="mining-address" class="grow" placeholder="NiceHash mining address (only needed to mine)" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="row">
+          <input id="mining-confirm" class="grow" placeholder="Type the confirmation phrase" autocomplete="off" spellcheck="false">
+          <label class="muted"><input type="checkbox" id="mining-remember"> Remember address on this PC</label>
+        </div>
+        <div class="actions">
+          <button class="primary" id="btn-mine">Start mining</button>
+          <button data-action="pause">Pause</button>
+          <button data-action="resume">Resume</button>
+          <button data-action="stop">Stop</button>
+        </div>
+      </section>
+
+      <section class="card" id="events">
+        <h2>Event log</h2>
+        <ol class="events" id="events-body"></ol>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

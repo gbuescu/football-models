@@ -1,0 +1,189 @@
+:root {
+  --bg: #f4f5f7;
+  --panel: #ffffff;
+  --text: #1c1e21;
+  --muted: #5b6270;
+  --line: #dde1e7;
+  --accent: #2459c7;
+  --accent-text: #ffffff;
+  --ok: #1b7f3b;
+  --warn: #9a6200;
+  --bad: #b3261e;
+  --chip-ok: #e3f4e8;
+  --chip-warn: #fff1d6;
+  --chip-bad: #fde4e1;
+  --chip-info: #e6edfb;
+  --stop: #c62828;
+  --stop-hover: #a31515;
+  --mono: "Cascadia Mono", Consolas, "SFMono-Regular", monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15171b;
+    --panel: #1e2126;
+    --text: #e8eaed;
+    --muted: #a3a9b4;
+    --line: #333841;
+    --accent: #6d9bff;
+    --accent-text: #0d1117;
+    --ok: #5fcf83;
+    --warn: #f0b44c;
+    --bad: #ff7b72;
+    --chip-ok: #1f3527;
+    --chip-warn: #3a2f17;
+    --chip-bad: #3d1f1d;
+    --chip-info: #1f2a40;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body { margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.45 "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+header.top {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 20px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+header.top h1 { font-size: 20px; margin: 0; letter-spacing: 0.2px; }
+header.top .sub { color: var(--muted); font-size: 13px; }
+header.top .spacer { flex: 1; }
+
+.pill {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  background: var(--chip-info);
+}
+.pill.ok { background: var(--chip-ok); color: var(--ok); }
+.pill.warn { background: var(--chip-warn); color: var(--warn); }
+.pill.bad { background: var(--chip-bad); color: var(--bad); }
+
+button.emergency {
+  background: var(--stop);
+  color: #fff;
+  border: 3px solid #fff;
+  outline: 3px solid var(--stop);
+  border-radius: 10px;
+  padding: 12px 22px;
+  font-size: 17px;
+  font-weight: 800;
+  letter-spacing: 0.6px;
+  cursor: pointer;
+  min-width: 210px;
+}
+button.emergency:hover, button.emergency:focus-visible { background: var(--stop-hover); }
+
+main { padding: 16px 20px 40px; max-width: 1500px; margin: 0 auto; }
+
+.banner {
+  background: var(--chip-info);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 16px;
+}
+.banner.bad { background: var(--chip-bad); }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 440px), 1fr));
+  gap: 16px;
+}
+
+section.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px 16px 16px;
+  min-width: 0;
+}
+section.card.wide { grid-column: 1 / -1; }
+section.card h2 { font-size: 16px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+section.card h3 { font-size: 14px; margin: 14px 0 6px; }
+
+table.kv, table.data { width: 100%; border-collapse: collapse; font-size: 14px; table-layout: fixed; }
+table.kv td, table.data td { overflow-wrap: anywhere; }
+table.kv td, table.data td, table.data th { padding: 4px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.kv td:first-child { color: var(--muted); width: 44%; }
+table.data th { text-align: left; color: var(--muted); font-weight: 600; }
+table.data th:first-child { width: 46%; }
+table.data td.num, table.data th.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+.src { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+button {
+  font: inherit;
+  border-radius: 7px;
+  padding: 7px 14px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+}
+button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+ul.issues { margin: 6px 0; padding-left: 0; list-style: none; }
+ul.issues li { padding: 5px 8px; border-radius: 6px; margin-bottom: 4px; font-size: 13.5px; }
+ul.issues li.blocker, ul.issues li.error { background: var(--chip-bad); }
+ul.issues li.warning { background: var(--chip-warn); }
+ul.issues li.info { background: var(--chip-info); }
+
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; }
+.tile { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.tile .label { color: var(--muted); font-size: 12px; }
+.tile .value { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.tile .src { display: block; }
+svg.spark { width: 100%; height: 34px; display: block; }
+svg.spark polyline { fill: none; stroke: var(--accent); stroke-width: 1.6; }
+
+.routes { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 14px; }
+.route { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.verdict { font-weight: 600; margin: 4px 0 10px; }
+
+form.inline { display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; align-items: center; }
+form.inline label { color: var(--muted); font-size: 14px; }
+input, select {
+  font: inherit;
+  padding: 5px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+  min-width: 0;
+}
+input.num { width: 120px; text-align: right; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+.row input.grow { flex: 1; min-width: 200px; }
+
+ol.events { margin: 0; padding-left: 18px; max-height: 240px; overflow: auto; font-size: 13px; }
+ol.events li.warning { color: var(--warn); }
+ol.events li.error { color: var(--bad); font-weight: 600; }
+
+details summary { cursor: pointer; color: var(--muted); margin-top: 8px; }
+
+@media (max-width: 640px) {
+  header.top { flex-wrap: wrap; padding: 10px 16px; }
+  button.emergency { width: 100%; }
+  main { padding: 12px 16px 32px; }
+}
