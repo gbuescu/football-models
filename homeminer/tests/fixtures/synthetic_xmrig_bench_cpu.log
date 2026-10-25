@@ -1,0 +1,6 @@
+[2026-10-25 10:00:00.000]  config   configuration saved to: "config.json"
+[2026-10-25 10:00:00.010]  cpu      use profile  rx  (8 threads) scratchpad 2048 KB
+[2026-10-25 10:00:00.020]  randomx  init dataset algo rx/0 (16 threads) seed 0000000000000000...
+[2026-10-25 10:00:00.030]  randomx  allocated 2336 MB (2080+256) huge pages 0% 0/1168 -JIT (12 ms)
+[2026-10-25 10:00:05.000]  bench    start benchmark hashes 1M algo rx/0
+[2026-10-25 10:02:15.512]  bench    benchmark finished in 130.512 seconds (7662.1 h/s) hash sum = 6C3C3A4F0E5D4B21

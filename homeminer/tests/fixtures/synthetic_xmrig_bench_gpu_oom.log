@@ -1,0 +1,3 @@
+[2026-10-25 11:00:00.000]  nvidia   CUDA 12.9/13.0 plugin version 6.22.1
+[2026-10-25 11:00:01.000]  nvidia   thread #0 failed with error <randomx_prepare>:85 "out of memory"
+[2026-10-25 11:00:01.100]  nvidia   disabled (failed to start threads)
