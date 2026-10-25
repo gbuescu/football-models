@@ -1,0 +1,1 @@
+{"_fixture":"Synthetic test values with NiceHash's response shape. NOT real market data.","miningAlgorithms":[{"algorithm":"SHA256","title":"SHA256","speed":"1.0","paying":"0.00000045"},{"algorithm":"RANDOMXMONERO","title":"RandomXmonero","speed":"1.0","paying":"0.0000002"},{"algorithm":"KAWPOW","title":"KawPow","speed":"1.0","paying":"0.00002"}]}
